@@ -36,6 +36,10 @@ pub struct Settings {
     pub silent_start: bool,
     pub logging: bool,
     pub high_fps: bool,
+    /// 大小核兼容模式：**手动**开启，仅 Intel P+E 混合核机型需要。
+    /// 开启后按大小核口径**分组统计** P 核 / E 核占用率（额外出 `cpu_load_p` / `cpu_load_e`），
+    /// 总数 `cpu_load` 不变（仍是与任务管理器一致的等权平均）。同构核机型保持关闭。
+    pub hybrid_compat: bool,
     pub theme: String,
     pub close_to_tray: bool,
     pub devtools: bool,
@@ -52,6 +56,7 @@ impl Default for Settings {
             silent_start: false,
             logging: true,
             high_fps: false,
+            hybrid_compat: false,
             theme: "dark".into(),
             close_to_tray: true,
             devtools: false,
@@ -90,6 +95,7 @@ impl Settings {
             silent_start: s("app.silent_start").map(truthy).unwrap_or(d.silent_start),
             logging: s("app.logging").map(truthy).unwrap_or(d.logging),
             high_fps: s("app.high_fps").map(truthy).unwrap_or(d.high_fps),
+            hybrid_compat: s("app.hybrid_compat").map(truthy).unwrap_or(d.hybrid_compat),
             theme: {
                 let def = d.theme.clone();
                 pick("ui.theme", ["dark", "light"], &def)
@@ -121,6 +127,9 @@ impl Settings {
              logging={}\n\
              ; 高刷模式：1 = 面板 / 预览 ~30fps，0 = 普通 ~10fps（省 CPU）\n\
              high_fps={}\n\
+             ; 大小核兼容模式：仅 Intel 大小核（P 核 + E 核）机型需要开启；\n\
+             ; 开启后按大小核口径分组统计 P 核 / E 核占用率（同构核机型请保持 0）\n\
+             hybrid_compat={}\n\
              \n\
              [ui]\n\
              ; dark / light\n\
@@ -140,6 +149,7 @@ impl Settings {
             b(self.silent_start),
             b(self.logging),
             b(self.high_fps),
+            b(self.hybrid_compat),
             self.theme,
             b(self.close_to_tray),
             b(self.devtools),
@@ -260,6 +270,7 @@ pub fn apply_patch(patch: &Value) -> Result<Settings, String> {
     s.silent_start = b("silentStart", s.silent_start);
     s.logging = b("logging", s.logging);
     s.high_fps = b("highFps", s.high_fps);
+    s.hybrid_compat = b("hybridCompat", s.hybrid_compat);
     s.close_to_tray = b("closeToTray", s.close_to_tray);
     s.devtools = b("devtools", s.devtools);
     let theme = t("theme", &s.theme);
@@ -286,6 +297,7 @@ pub fn to_json(s: &Settings) -> Value {
         "silentStart": s.silent_start,
         "logging": s.logging,
         "highFps": s.high_fps,
+        "hybridCompat": s.hybrid_compat,
         "theme": s.theme,
         "closeToTray": s.close_to_tray,
         "devtools": s.devtools,

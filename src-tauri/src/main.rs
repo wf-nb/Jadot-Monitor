@@ -36,6 +36,10 @@ fn main() {
         println!("{}", jiaidian_monitor_lib::dump_units_json());
         return;
     }
+    if args.iter().any(|a| a == "--dump-cpu") {
+        println!("{}", jiaidian_monitor_lib::dump_cpu_json());
+        return;
+    }
     // 单位设置：与 `--shot` / `--render` 同一条命令行时**只设置不返回**（同一个进程内生效），
     // 方便无界面验证「手动指定单位」的效果。
     if let Some(i) = args.iter().position(|a| a == "--units") {

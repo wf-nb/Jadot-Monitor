@@ -596,11 +596,37 @@ pub fn source_hint() -> String {
 
 /// 基础指标：读数据源，再补 Win32 项。
 pub fn basic() -> Vec<BasicMetric> {
-    if let Some(v) = crate::source_lhws::read() {
-        return v;
-    }
-    // 没读到：只给 Win32 能算出来的项（其余显示 —）
     let mut out: Vec<BasicMetric> = Vec::new();
-    win32_fill(&mut out);
+    // CPU 占用率**自算**（见 `cpu_usage.rs`）：主口径 = PDH `% Processor Utility`（与任务管理器一致），
+    // 兜底 = `GetSystemTimes`。**不依赖 LHS** —— 所以 LHS 瞬断时它依然有值，不会像其它项那样"冻结"。
+    // 值按任务管理器的做法截到 100（睿频时 `% Processor Utility` 可 >100，原始值见 `--dump-cpu`）。
+    let cpu = crate::cpu_usage::read();
+    push(
+        &mut out,
+        "CPU",
+        "cpu_load",
+        "CPU 占用率",
+        "%",
+        1,
+        cpu.and_then(|s| s.load()).map(|v| v.clamp(0.0, 100.0)),
+        cpu.map(|s| s.source()).unwrap_or("自算 · 采样未就绪"),
+    );
+    // 大小核兼容模式：**仅当开关开启且确实检测到两类核**时才出这两项（同构核不会出现）。
+    // 总数 `cpu_load` 不变（仍是与任务管理器一致的等权平均），这两项是"额外补充"。
+    if let Some(s) = cpu {
+        let c = |v: Option<f64>| v.map(|x| x.clamp(0.0, 100.0));
+        if let Some(p) = c(s.load_p) {
+            push(&mut out, "CPU", "cpu_load_p", "P 核占用率", "%", 1, Some(p), "自算 · PDH 效用（P 核组平均）");
+        }
+        if let Some(e) = c(s.load_e) {
+            push(&mut out, "CPU", "cpu_load_e", "E 核占用率", "%", 1, Some(e), "自算 · PDH 效用（E 核组平均）");
+        }
+    }
+    match crate::source_lhws::read() {
+        // LHS 的各项（温度 / 功耗 / 内存 / GPU / 风扇 …）；里面已经带了一次 `win32_fill`
+        Some(v) => out.extend(v),
+        // LHS 不可用：只剩自算 CPU + Win32 能算的（网络 / 磁盘容量 / 开机时长），其余槽位不出现
+        None => win32_fill(&mut out),
+    }
     out
 }

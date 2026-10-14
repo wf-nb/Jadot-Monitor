@@ -10,6 +10,8 @@
 //!
 //! **弃用这一路 = 删本文件 + `metrics.rs::basic()` 里两行。**
 
+use std::sync::Mutex;
+
 use crate::metrics::{BasicMetric, disk_temps, push, push_text, short_cpu, short_gpu, win32_fill};
 use serde_json::Value;
 
@@ -46,7 +48,19 @@ unsafe fn read_data_block() -> Result<Vec<u8>, String> {
     let result = (|| -> Result<Vec<u8>, String> {
         let map = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, wide(MMF).as_ptr()) };
         if map.is_null() {
-            return Err("服务未运行（共享内存不存在）".into());
+            // **必须分清「真的不存在」与「存在但打不开」**——两者根因完全不同：
+            //   · 不存在（2）：服务进程没跑，**或者刚启动、硬件还没枚举完、尚未发布共享内存**；
+            //   · 打不开（5）：映射在，但权限 / 会话 / 命名空间不通。
+            // 以前一律报「服务未运行」，会把排查方向带偏（服务其实是 Running）。
+            use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, GetLastError};
+            let code = unsafe { GetLastError() };
+            return Err(match code {
+                ERROR_FILE_NOT_FOUND => {
+                    "共享内存不存在（服务进程未运行，或刚启动尚未发布数据）".to_string()
+                }
+                ERROR_ACCESS_DENIED => "共享内存打不开（权限不足，错误 5）".to_string(),
+                c => format!("共享内存打不开（错误 {c}）"),
+            });
         }
         let view = unsafe { MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0) };
         if view.Value.is_null() {
@@ -170,12 +184,53 @@ fn parse(data: &[u8]) -> Vec<S> {
     out
 }
 
-/// 读一遍并映射成 23 项指标；读不到返回 `None`。
+/// 数据源故障的合并状态：`Some((原因, 已抑制条数))`。
+///
+/// **为什么要合并**：`metrics::basic()` 一秒会被调用两次（界面轮询 + 面板 `/metrics`），
+/// 数据源一断就是 2 条/秒 WARN 刷屏。同一原因只记第一条，恢复时汇总一条，日志立刻可读。
+static FAIL: Mutex<Option<(String, u64)>> = Mutex::new(None);
+
+/// 记录一次失败：同一原因只记第一条，后续只累计；原因变化时另起一条。
+fn note_fail(reason: &str) {
+    let mut g = FAIL.lock().unwrap();
+    match g.clone() {
+        Some((r, n)) if r == reason => *g = Some((r, n + 1)),
+        Some((r, n)) => {
+            *g = Some((reason.to_string(), 1));
+            drop(g);
+            crate::logging::warn(&format!(
+                "LibreHardwareService 数据源异常（原因变化：{r} → {reason}；此前 {n} 次同类已抑制）：{reason}"
+            ));
+        }
+        None => {
+            *g = Some((reason.to_string(), 1));
+            drop(g);
+            crate::logging::warn(&format!(
+                "LibreHardwareService 不可用：{reason}（同一原因的后续失败合并记录，恢复时给汇总）"
+            ));
+        }
+    }
+}
+
+/// 记录一次成功：若之前在故障中，汇总一条「已恢复」（带抑制了多少次采样）。
+fn note_ok() {
+    let hit = FAIL.lock().unwrap().take();
+    if let Some((reason, n)) = hit {
+        crate::logging::info(&format!(
+            "LibreHardwareService 已恢复（此前「{reason}」连续 {n} 次采样未取到，日志已抑制）"
+        ));
+    }
+}
+
+/// 读一遍并映射成指标；读不到返回 `None`。
 pub fn read() -> Option<Vec<BasicMetric>> {
     let data = match unsafe { read_data_block() } {
-        Ok(d) => d,
+        Ok(d) => {
+            note_ok();
+            d
+        }
         Err(e) => {
-            crate::logging::warn(&format!("LibreHardwareService 不可用：{e}"));
+            note_fail(&e);
             return None;
         }
     };
@@ -201,7 +256,11 @@ pub fn read() -> Option<Vec<BasicMetric>> {
             .find(|s| s.hw_type == "Cpu" && f(s))
             .map(|s| s.value)
     };
-    let load = cpu(&|s| s.is("Load") && (s.name.eq_ignore_ascii_case("CPU Total") || s.has("total")));
+    // **`cpu_load` 不在这里出**：LHM 的 `CPU Total` 用
+    // `SystemProcessorPerformanceInformation.IdleTime` 算占用，该字段在 Windows 11 上无效 →
+    // 占用率严重偏低（上游 PR #933 给了绕行方案，LHS 打包的版本未包含）。
+    // 我们改为**自算**（`cpu_usage.rs`：PDH `% Processor Utility` 为主 + `GetSystemTimes` 兜底），
+    // 由 `metrics::basic()` 统一出项 —— 顺带也不再随 LHS 瞬断而缺项。
     let temp = cpu(&|s| s.is("Temperature") && (s.has("tctl") || s.has("tdie") || s.has("package")))
         .or_else(|| {
             ss.iter()
@@ -214,7 +273,6 @@ pub fn read() -> Option<Vec<BasicMetric>> {
         .iter()
         .find(|s| s.hw_type == "Cpu" && s.is("Temperature"))
         .map(|s| src(s));
-    push(&mut out, "CPU", "cpu_load", "CPU 占用率", "%", 1, load, "LHS: CPU Total");
     push(&mut out, "CPU", "cpu_temp", "CPU 温度", "℃", 1, temp, core_temp.as_deref().unwrap_or("LHS: CPU 温度"));
     push(&mut out, "CPU", "cpu_power", "CPU 功耗", "W", 1, power, "LHS: CPU Package");
 

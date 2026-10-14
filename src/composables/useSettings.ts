@@ -18,6 +18,10 @@ const closeToTray = ref(true);
 const logging = ref(true);
 /// 高刷模式：开 = 面板 / 预览 ~30fps；关 = 普通 ~10fps（省 CPU）。
 const highFps = ref(false);
+/// 大小核兼容模式：**手动开启**，仅 Intel P+E 混合核机型需要。
+/// 开启后额外输出 P 核 / E 核两组占用率（`cpu_load_p` / `cpu_load_e`）；
+/// 总数 `cpu_load` 不变（仍与任务管理器一致）。同构核机型保持关闭。
+const hybridCompat = ref(false);
 
 // ---- 单位设置 ----
 /// 显示单位模式：`auto` 全自动（按素材 data-unit）/ `manual` 手动指定（按下面四族）
@@ -33,6 +37,7 @@ interface Settings {
   silentStart: boolean;
   logging: boolean;
   highFps: boolean;
+  hybridCompat: boolean;
   theme: "dark" | "light";
   closeToTray: boolean;
   devtools: boolean;
@@ -56,6 +61,7 @@ async function loadSettings() {
     if (typeof s.silentStart === "boolean") silentStart.value = s.silentStart;
     if (typeof s.logging === "boolean") logging.value = s.logging;
     if (typeof s.highFps === "boolean") highFps.value = s.highFps;
+    if (typeof s.hybridCompat === "boolean") hybridCompat.value = s.hybridCompat;
     if (s.unitMode === "manual" || s.unitMode === "auto") unitMode.value = s.unitMode;
     if (typeof s.unitCapacity === "string") unitCapacity.value = s.unitCapacity;
     if (typeof s.unitRate === "string") unitRate.value = s.unitRate;
@@ -78,6 +84,7 @@ function persist() {
       silentStart: silentStart.value,
       logging: logging.value,
       highFps: highFps.value,
+      hybridCompat: hybridCompat.value,
       unitMode: unitMode.value,
       unitCapacity: unitCapacity.value,
       unitRate: unitRate.value,
@@ -95,7 +102,7 @@ watch([theme, devtools, closeToTray], () => {
 
 // 其余设置：改动即写回（单位改动面板注入脚本每秒拉 `GET /units` → 立刻生效）
 watch(
-  [silentStart, logging, highFps, unitMode, unitCapacity, unitRate, unitTemp, unitDuration],
+  [silentStart, logging, highFps, hybridCompat, unitMode, unitCapacity, unitRate, unitTemp, unitDuration],
   () => persist(),
 );
 
@@ -133,6 +140,7 @@ export function useSettings() {
     closeToTray,
     logging,
     highFps,
+    hybridCompat,
     unitMode,
     unitCapacity,
     unitRate,

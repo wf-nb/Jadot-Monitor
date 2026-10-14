@@ -1,6 +1,7 @@
 mod api;
 mod assets;
 mod autostart;
+mod cpu_usage;
 mod device;
 mod diff;
 mod handoff;
@@ -499,12 +500,25 @@ pub fn start_api() {
 /// 无界面用途：把 23 项基础指标序列化成 JSON（供 `--dump-metrics` 命令行使用）。
 /// **采样两次**（间隔 1.2 s）：网络速率要两次采样才推得出来，只采一次永远是 `—`。
 pub fn dump_metrics_json() -> String {
+    // 网络速率要两次采样才推得出来；这段等待顺便当作 CPU 自算的采样间隔
     let _ = metrics::basic();
-    std::thread::sleep(std::time::Duration::from_millis(1200));
+    cpu_usage::sample_once(std::time::Duration::from_millis(1200));
     match serde_json::to_string_pretty(&metrics::basic()) {
         Ok(s) => s,
         Err(e) => format!("{{\"error\": \"{e}\"}}"),
     }
+}
+
+/// 无界面用途：**CPU 占用率的三条口径原始值**（供 `--dump-cpu` 排查 / 远程核对用）。
+///
+/// 同时给出 `utility`（PDH 效用，= 任务管理器）、`time`（PDH 时间）、`perf`（频率比）、
+/// `sysBusy`（`GetSystemTimes`）。判断"取数是否正常"看两条：
+/// ① `utility` 与同时打开的任务管理器总体 % 应当接近；② `sysBusy` 与 `time` 应当接近。
+/// **不要**用 `utility ≈ time × perf / 100` 去验算 —— 那个恒等式不成立（Windows 的效用模型更复杂）。
+pub fn dump_cpu_json() -> String {
+    // 同步采一次（不依赖后台线程）：一次性进程里线程可能来不及产出
+    cpu_usage::sample_once(std::time::Duration::from_millis(1200));
+    cpu_usage::dump_json()
 }
 
 /// 无界面用途：LibreHardwareService 共享内存里的**全部原始传感器**（供 `--dump-lhws` 排查用）。
@@ -546,6 +560,8 @@ pub fn run() {
     logging::init();
     logging::info("=== jiaidian-monitor 启动 ===");
     logging::info(&format!("数据源：{}", metrics::source_hint()));
+    // CPU 占用率自算的后台采样线程（1Hz）；不再依赖 LHS 的 CPU Total
+    cpu_usage::spawn();
 
     // 本地指标 API：面板网页直接 fetch，无需注入。
     api::spawn();

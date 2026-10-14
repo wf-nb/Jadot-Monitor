@@ -11,6 +11,7 @@ const {
   devtools,
   logging,
   highFps,
+  hybridCompat,
   unitMode,
   unitCapacity,
   unitRate,
@@ -107,6 +108,17 @@ onMounted(() => {
         开 = 面板与预览 ~30fps（动画更顺滑，CPU / 带宽更高）；
         关 = 普通 ~10fps（省资源，指标本来就每秒才刷新一次，看数值不受影响）。
         抓屏节奏与最终下发节奏保持一致，改完立即生效。
+      </p>
+      <div class="row">
+        <span class="lbl">大小核兼容模式</span>
+        <label class="sw">
+          <input type="checkbox" v-model="hybridCompat" />
+        </label>
+      </div>
+      <p class="hint">
+        仅 <b>Intel 大小核（P 核 + E 核）</b>机型需要开启：开启后额外统计 <b>P 核 / E 核</b>
+        两组占用率（P/E 分别平均）。总数不变 —— 仍与任务管理器口径一致。
+        同构核机型（如 AMD 全大核）请保持关闭。
       </p>
     </div>
 
