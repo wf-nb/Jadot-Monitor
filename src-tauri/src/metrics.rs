@@ -594,39 +594,101 @@ pub fn source_hint() -> String {
     "LibreHardwareService".into()
 }
 
-/// 基础指标：读数据源，再补 Win32 项。
+/// 基础指标：模式固定为本次快照；切换期间返回缺值，不跨模式回退。
 pub fn basic() -> Vec<BasicMetric> {
-    let mut out: Vec<BasicMetric> = Vec::new();
-    // CPU 占用率**自算**（见 `cpu_usage.rs`）：主口径 = PDH `% Processor Utility`（与任务管理器一致），
-    // 兜底 = `GetSystemTimes`。**不依赖 LHS** —— 所以 LHS 瞬断时它依然有值，不会像其它项那样"冻结"。
-    // 值按任务管理器的做法截到 100（睿频时 `% Processor Utility` 可 >100，原始值见 `--dump-cpu`）。
-    let cpu = crate::cpu_usage::read();
-    push(
-        &mut out,
-        "CPU",
-        "cpu_load",
-        "CPU 占用率",
-        "%",
-        1,
-        cpu.and_then(|s| s.load()).map(|v| v.clamp(0.0, 100.0)),
-        cpu.map(|s| s.source()).unwrap_or("自算 · 采样未就绪"),
-    );
-    // 大小核兼容模式：**仅当开关开启且确实检测到两类核**时才出这两项（同构核不会出现）。
-    // 总数 `cpu_load` 不变（仍是与任务管理器一致的等权平均），这两项是"额外补充"。
-    if let Some(s) = cpu {
-        let c = |v: Option<f64>| v.map(|x| x.clamp(0.0, 100.0));
-        if let Some(p) = c(s.load_p) {
-            push(&mut out, "CPU", "cpu_load_p", "P 核占用率", "%", 1, Some(p), "自算 · PDH 效用（P 核组平均）");
+    let token = crate::cpu_usage::mode_token();
+    let mut out = match crate::source_lhws::read() {
+        Some(v) => v,
+        None => {
+            let mut v = Vec::new();
+            win32_fill(&mut v);
+            v
         }
-        if let Some(e) = c(s.load_e) {
-            push(&mut out, "CPU", "cpu_load_e", "E 核占用率", "%", 1, Some(e), "自算 · PDH 效用（E 核组平均）");
+    };
+    match crate::cpu_usage::read_for_mode(token) {
+        Err(()) => {
+            out.retain(|m| !is_cpu_usage(&m.key));
+            push(&mut out, "CPU", "cpu_load", "CPU 占用率", "%", 1, None,
+                "CPU 模式已切换，等待新快照");
         }
+        Ok(sample) => select_cpu_source(&mut out, token.0, sample),
     }
-    match crate::source_lhws::read() {
-        // LHS 的各项（温度 / 功耗 / 内存 / GPU / 风扇 …）；里面已经带了一次 `win32_fill`
-        Some(v) => out.extend(v),
-        // LHS 不可用：只剩自算 CPU + Win32 能算的（网络 / 磁盘容量 / 开机时长），其余槽位不出现
-        None => win32_fill(&mut out),
-    }
+    sort_groups(&mut out);
     out
+}
+
+fn is_cpu_usage(key: &str) -> bool {
+    matches!(key, "cpu_load" | "cpu_load_p" | "cpu_load_e")
+}
+
+fn select_cpu_source(out: &mut Vec<BasicMetric>, enabled: bool, cpu: Option<crate::cpu_usage::Sample>) {
+    if !enabled {
+        out.retain(|m| !matches!(m.key.as_str(), "cpu_load_p" | "cpu_load_e"));
+        if !out.iter().any(|m| m.key == "cpu_load") {
+            push(out, "CPU", "cpu_load", "CPU 占用率", "%", 1, None, "LHS: CPU Total 不可用");
+        }
+        return;
+    }
+    // 开启时只认本代自算，不借用 LHS 的CPU Total作为预热/故障回退。
+    out.retain(|m| !is_cpu_usage(&m.key));
+    push(out, "CPU", "cpu_load", "CPU 占用率", "%", 1,
+        cpu.and_then(|s| s.load()).map(|v| v.clamp(0.0, 100.0)),
+        cpu.map(|s| s.source()).unwrap_or("自算 · 采样未就绪"));
+    if let Some(s) = cpu {
+        let valid = |v: Option<f64>| v.filter(|x| x.is_finite() && *x >= 0.0).map(|x| x.min(100.0));
+        if let Some(v) = valid(s.load_p) {
+            push(out, "CPU", "cpu_load_p", "P 核占用率", "%", 1, Some(v), "自算 · PDH 效用（P 核组平均）");
+        }
+        if let Some(v) = valid(s.load_e) {
+            push(out, "CPU", "cpu_load_e", "E 核占用率", "%", 1, Some(v), "自算 · PDH 效用（E 核组平均）");
+        }
+    }
+}
+
+#[cfg(test)]
+mod cpu_mode_tests {
+    use super::*;
+    use crate::cpu_usage::Sample;
+
+    #[test]
+    fn disabled_keeps_lhs_and_ignores_computed_sample() {
+        let mut out = Vec::new();
+        push(&mut out, "CPU", "cpu_load", "CPU", "%", 1, Some(23.0), "LHS: CPU Total");
+        select_cpu_source(&mut out, false, Some(Sample { utility: Some(91.0), ..Sample::default() }));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].value, Some(23.0));
+        assert_eq!(out[0].source, "LHS: CPU Total");
+    }
+
+    #[test]
+    fn disabled_unavailable_never_falls_back_to_computed() {
+        let mut out = Vec::new();
+        select_cpu_source(&mut out, false, Some(Sample { utility: Some(91.0), ..Sample::default() }));
+        assert_eq!(out[0].value, None);
+        assert!(out[0].source.starts_with("LHS:"));
+    }
+
+    #[test]
+    fn enabled_removes_lhs_even_while_warming_up() {
+        let mut out = Vec::new();
+        push(&mut out, "CPU", "cpu_load", "CPU", "%", 1, Some(23.0), "LHS: CPU Total");
+        select_cpu_source(&mut out, true, None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].value, None);
+        assert!(out[0].source.starts_with("自算"));
+    }
+
+    #[test]
+    fn enabled_publishes_one_total_and_valid_groups_only() {
+        let mut out = Vec::new();
+        push(&mut out, "CPU", "cpu_load", "CPU", "%", 1, Some(23.0), "LHS: CPU Total");
+        select_cpu_source(&mut out, true, Some(Sample {
+            utility: Some(f64::NAN), time: Some(42.0), load_p: Some(f64::INFINITY),
+            load_e: Some(18.0), ..Sample::default()
+        }));
+        assert_eq!(out.iter().filter(|m| m.key == "cpu_load").count(), 1);
+        assert_eq!(out[0].value, Some(42.0));
+        assert!(!out.iter().any(|m| m.key == "cpu_load_p"));
+        assert!(out.iter().any(|m| m.key == "cpu_load_e"));
+    }
 }

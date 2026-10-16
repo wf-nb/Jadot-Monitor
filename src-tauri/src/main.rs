@@ -10,7 +10,8 @@ fn main() {
         std::env::set_var(
             "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
             format!(
-                "--remote-debugging-port={} --disable-features=CalculateNativeWinOcclusion",
+                "--remote-debugging-port={} --disable-features=CalculateNativeWinOcclusion \
+                 --disable-web-security --allow-file-access-from-files",
                 jiaidian_monitor_lib::PANEL_CDP_PORT
             ),
         );

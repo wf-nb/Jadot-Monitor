@@ -43,6 +43,24 @@ async fn lhws_install() -> Result<serde_json::Value, String> {
         .map_err(|e| e.to_string())?
 }
 
+/// **重新启动** LibreHardwareService：停 → 起 → 等数据就绪（会弹一次 UAC，除非已有权限）。
+///
+/// 除了"服务没在跑"，也能治"服务在跑但读不到数据"（卡住）的情况。
+#[tauri::command]
+async fn lhws_restart() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(lhws_install::restart)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// **卸载** LibreHardwareService：提权 `msiexec /x` + 清理我们自己的下载缓存。
+#[tauri::command]
+async fn lhws_uninstall() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(lhws_install::uninstall)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// 当前**启用了哪几路**数据源（前端据此决定要不要提示装 LibreHardwareService）。
 #[tauri::command]
 fn data_sources() -> serde_json::Value {
@@ -62,9 +80,6 @@ fn settings_get() -> serde_json::Value {
 #[tauri::command]
 fn settings_set(patch: serde_json::Value) -> Result<serde_json::Value, String> {
     let s = settings::apply_patch(&patch)?;
-    logging::set_enabled(s.logging);
-    pipeline::set_high_fps(s.high_fps);
-    crate::units::set(s.unit_mode.clone(), s.units_map());
     logging::info(&format!(
         "[ui] 设置已保存（silent_start={} logging={} high_fps={} units={}）",
         s.silent_start as u8, s.logging as u8, s.high_fps as u8, s.unit_mode
@@ -494,6 +509,8 @@ fn build_test_frame(w: u32, h: u32) -> Vec<u8> {
 
 /// 启动本地指标 API（CLI 无界面模式下也能用）。
 pub fn start_api() {
+    // GUI / 独立截图与渲染共用模式门控；关闭时不启动自算采样。
+    cpu_usage::spawn();
     api::spawn();
 }
 
@@ -509,14 +526,11 @@ pub fn dump_metrics_json() -> String {
     }
 }
 
-/// 无界面用途：**CPU 占用率的三条口径原始值**（供 `--dump-cpu` 排查 / 远程核对用）。
-///
-/// 同时给出 `utility`（PDH 效用，= 任务管理器）、`time`（PDH 时间）、`perf`（频率比）、
-/// `sysBusy`（`GetSystemTimes`）。判断"取数是否正常"看两条：
-/// ① `utility` 与同时打开的任务管理器总体 % 应当接近；② `sysBusy` 与 `time` 应当接近。
-/// **不要**用 `utility ≈ time × perf / 100` 去验算 —— 那个恒等式不成立（Windows 的效用模型更复杂）。
+/// CPU 诊断：遵守大小核兼容模式，关闭时不强制采样。
+/// Utility 是效用口径，Time/GetSystemTimes 是时间口径，不承诺与任务管理器恒等。
+/// 保留 PDH 默认封顶语义，不把输出称为原始 uncapped 数值。
 pub fn dump_cpu_json() -> String {
-    // 同步采一次（不依赖后台线程）：一次性进程里线程可能来不及产出
+    // 开启时等待唯一worker的一轮采样；关闭时只等待，不启动自算。
     cpu_usage::sample_once(std::time::Duration::from_millis(1200));
     cpu_usage::dump_json()
 }
@@ -560,7 +574,7 @@ pub fn run() {
     logging::init();
     logging::info("=== jiaidian-monitor 启动 ===");
     logging::info(&format!("数据源：{}", metrics::source_hint()));
-    // CPU 占用率自算的后台采样线程（1Hz）；不再依赖 LHS 的 CPU Total
+    // 可选 CPU 自算控制器：关闭时不采样，默认 CPU 总值来自 LHS。
     cpu_usage::spawn();
 
     // 本地指标 API：面板网页直接 fetch，无需注入。
@@ -619,6 +633,8 @@ pub fn run() {
             preview_subscribe,
             lhws_state,
             lhws_install,
+            lhws_restart,
+            lhws_uninstall,
             data_sources,
             open_url,
             usb_list,

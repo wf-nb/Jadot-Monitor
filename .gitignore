@@ -6,6 +6,10 @@ dist/
 dist-ssr/
 target/
 *.local
+# tsc -b 的增量缓存与 vite.config.ts 的编译输出（根目录，不入库）
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
 
 # ── 运行时产物 ──
 logs

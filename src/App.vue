@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -103,19 +103,57 @@ const error = ref("");
 const {
   theme,
   closeToTray,
+  hybridCompat,
+  settingsSaving,
+  settingsReady,
   loadSettings,
   loadAutostart,
 } = useSettings();
 
 // ---------------- 指标 ----------------
 const metrics = ref<BasicMetric[]>([]);
+const cpuLoadKeys = new Set(["cpu_load", "cpu_load_p", "cpu_load_e"]);
 let timer: number | undefined;
+let refreshBusy = false;
+let refreshRevision = 0;
+let metricsDisposed = false;
+let cpuModePending = false;
+function invalidateCpuLoads() {
+  metrics.value = metrics.value.map((m) => cpuLoadKeys.has(m.key)
+    ? { ...m, value: null, text: "—" }
+    : m);
+}
+watch(hybridCompat, () => {
+  cpuModePending = settingsReady.value;
+  refreshRevision++;
+  invalidateCpuLoads();
+}, { flush: "sync" });
+watch(settingsSaving, (saving) => {
+  if (!saving && cpuModePending) {
+    cpuModePending = false;
+    refreshRevision++;
+    invalidateCpuLoads();
+    void refresh();
+  }
+}, { flush: "sync" });
 async function refresh() {
+  if (refreshBusy || metricsDisposed) return;
+  refreshBusy = true;
+  const revision = refreshRevision;
   try {
-    metrics.value = await invoke<BasicMetric[]>("basic_metrics");
+    const next = await invoke<BasicMetric[]>("basic_metrics");
+    if (metricsDisposed || revision !== refreshRevision) return;
+    metrics.value = next.map((m) => cpuLoadKeys.has(m.key) && (
+      cpuModePending || m.value === null || !Number.isFinite(m.value) ||
+      (!hybridCompat.value && m.key !== "cpu_load")
+    ) ? { ...m, value: null, text: "—" } : m);
     error.value = "";
   } catch (e) {
+    if (metricsDisposed || revision !== refreshRevision) return;
+    invalidateCpuLoads();
     error.value = String(e);
+  } finally {
+    refreshBusy = false;
   }
 }
 // 指标显示：单位由后端按规范给出（素材要什么单位由素材自己声明，见 data-unit）
@@ -324,6 +362,14 @@ interface LhwsState {
   version: string;
   installed: boolean;
   running: boolean;
+  /** SCM 真实服务状态 */
+  serviceState: string;
+  /** 是否在发布数据（共享内存存在） */
+  publishing: boolean;
+  /** 合并态：notInstalled / stopped / starting / running / unknown */
+  status: string;
+  /** 中文文案 */
+  statusText: string;
   source: string;
   license: string;
   licenseUrl: string;
@@ -334,6 +380,36 @@ const srcState = ref<LhwsState | null>(null);
 const srcBusy = ref(false);
 const srcMsg = ref("");
 
+/// 弹窗标题：把"没装"和"装了但没跑"分开说清楚
+function srcTitle(s: LhwsState | null): string {
+  if (!s) return "LibreHardwareService 不可用";
+  switch (s.status) {
+    case "notInstalled":
+      return "未安装 LibreHardwareService";
+    case "stopped":
+      return "LibreHardwareService 已停止";
+    case "starting":
+      return "LibreHardwareService 数据未就绪";
+    default:
+      return "LibreHardwareService 不可用";
+  }
+}
+
+/// 弹窗正文
+function srcTip(s: LhwsState | null): string {
+  if (!s) return "";
+  switch (s.status) {
+    case "notInstalled":
+      return "CPU / GPU / 内存 / 温度 / 风扇这些指标靠它提供，现在读不到。点「一键安装」即可恢复（会弹一次 UAC）。";
+    case "stopped":
+      return "组件装好了，但它的服务进程没在运行 —— 常见原因是开机时它与网卡初始化撞车而退出，之后不会被自动拉起。点「重新启动」即可恢复（会弹一次 UAC）。";
+    case "starting":
+      return "服务进程已经起来了，但还没发布数据（初始化通常 5~7 秒）。先稍等几秒「重新检测」；一直不行就「重新启动」。";
+    default:
+      return "读不到它的运行状态，可以先「重新检测」，或直接「重新启动」（会弹一次 UAC）。";
+  }
+}
+
 async function checkDataSource() {
   try {
     const en = await invoke<{ lhws: boolean }>("data_sources");
@@ -343,7 +419,7 @@ async function checkDataSource() {
     if (!s.running) {
       srcMsg.value = "";
       srcDlg.value = true;
-      logEvent(`数据源自检：LibreHardwareService installed=${s.installed} running=${s.running} → 弹窗引导`);
+      logEvent(`数据源自检：LibreHardwareService status=${s.status}（service=${s.serviceState} publishing=${s.publishing}）→ 弹窗引导`);
     }
   } catch (e) {
     logEvent(`数据源自检失败：${e}`);
@@ -355,7 +431,7 @@ async function installDataSource() {
   srcMsg.value = "正在下载并安装（会弹一次 UAC，请确认）…";
   try {
     srcState.value = await invoke<LhwsState>("lhws_install");
-    srcMsg.value = "安装完成";
+    srcMsg.value = srcState.value.running ? "" : "已安装，但服务还没在发布数据 —— 可点「重新启动」。";
     if (srcState.value.running) {
       srcDlg.value = false;
       logEvent("数据源已就绪");
@@ -363,6 +439,29 @@ async function installDataSource() {
     }
   } catch (e) {
     srcMsg.value = `安装失败：${e}`;
+  } finally {
+    srcBusy.value = false;
+  }
+}
+
+/// 重新启动服务（停 → 起），用于"装好了但没在跑"的情况
+async function restartDataSource() {
+  srcBusy.value = true;
+  srcMsg.value = "正在重新启动服务（会弹一次 UAC，请确认）…";
+  try {
+    srcState.value = await invoke<LhwsState>("lhws_restart");
+    srcMsg.value = "";
+    srcDlg.value = false;
+    logEvent("数据源已重新启动");
+    refresh();
+  } catch (e) {
+    srcMsg.value = String(e);
+    // 失败也要拉一次真实状态，别让弹窗显示过期信息
+    try {
+      srcState.value = await invoke<LhwsState>("lhws_state");
+    } catch {
+      /* 忽略 */
+    }
   } finally {
     srcBusy.value = false;
   }
@@ -378,7 +477,7 @@ async function recheckDataSource() {
       logEvent("数据源已就绪（重新检测）");
       refresh();
     } else {
-      srcMsg.value = "还是没检测到服务在运行。";
+      srcMsg.value = `仍未就绪：${s.statusText}。`;
     }
   } catch (e) {
     srcMsg.value = String(e);
@@ -692,6 +791,8 @@ onMounted(async () => {
     });
 });
 onUnmounted(() => {
+  metricsDisposed = true;
+  refreshRevision++;
   if (timer) clearInterval(timer);
   if (resizeTimer) clearTimeout(resizeTimer);
   unlistenResize?.();
@@ -889,25 +990,30 @@ onUnmounted(() => {
     <div v-if="srcDlg" class="modal-mask">
       <div class="modal">
         <h3>
-          <Icon :icon="srcState?.installed ? 'line-md:alert' : 'line-md:cloud-alt-download'" />
-          {{ srcState?.installed ? "LibreHardwareService 未运行" : "未安装 LibreHardwareService" }}
+          <Icon :icon="srcState?.status === 'notInstalled' ? 'line-md:cloud-alt-download' : 'line-md:alert'" />
+          {{ srcTitle(srcState) }}
         </h3>
-        <p class="hint">
-          {{
-            srcState?.installed
-              ? "CPU / GPU / 内存 / 温度 / 风扇这些指标靠它提供，现在读不到。先「重新检测」；仍不行就重装一次。"
-              : "CPU / GPU / 内存 / 温度 / 风扇这些指标靠它提供，现在读不到。点「一键安装」即可恢复（会弹一次 UAC）。"
-          }}
-        </p>
+        <p class="hint">{{ srcTip(srcState) }}</p>
         <p v-if="srcMsg" class="hint">{{ srcMsg }}</p>
+        <p class="hint">
+          当前状态：{{ srcState?.statusText }}（服务 {{ srcState?.serviceState }} · 数据 {{ srcState?.publishing ? "已发布" : "未发布" }}）
+        </p>
         <p class="hint">
           第三方开源组件 {{ srcState?.version }}（{{ srcState?.license }}）·
           <a @click="openSrcUrl(srcState?.source || '')">来源</a> ·
           <a @click="openSrcUrl(srcState?.licenseUrl || '')">许可</a>
         </p>
         <div class="btns">
-          <button class="primary" :disabled="srcBusy" @click="installDataSource">
+          <button
+            v-if="srcState?.status === 'notInstalled'"
+            class="primary"
+            :disabled="srcBusy"
+            @click="installDataSource"
+          >
             {{ srcBusy ? "安装中…" : "一键安装" }}
+          </button>
+          <button v-else class="primary" :disabled="srcBusy" @click="restartDataSource">
+            {{ srcBusy ? "处理中…" : "重新启动" }}
           </button>
           <button :disabled="srcBusy" @click="recheckDataSource">重新检测</button>
           <button :disabled="srcBusy" @click="srcDlg = false">稍后</button>

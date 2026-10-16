@@ -340,10 +340,29 @@ function suffix(slot,unit){
     else if(cur!==want){ el.setAttribute('data-suffix',want); }
   }
 }
+var CPU_LOADS=['cpu_load','cpu_load_p','cpu_load_e'];
+function clearCpuLoad(key){
+  // 仍走素材 setter：已抽查的素材透传非数字文本；只接受数字的旧 setter 可能无法显示「—」。
+  // 不猜测其内部解析规则，也不绕过 setter 写 innerHTML，以免破坏条形/圆环结构。
+  try{window.__setSlot(key,'—');}catch(e){}
+}
+function clearCpuLoads(){
+  for(var i=0;i<CPU_LOADS.length;i++)clearCpuLoad(CPU_LOADS[i]);
+}
 function apply(list,cfg){
   if(cfg&&cfg.mode)CFG=cfg;
+  var available={};
   for(var i=0;i<list.length;i++){
     var m=list[i];
+    if(CPU_LOADS.indexOf(m.key)!==-1&&typeof m.value==='number'&&isFinite(m.value))available[m.key]=true;
+  }
+  // 缺项、null、非有限值均清理；不存在的 P/E 不作为数值 0 喂给素材。
+  for(var i=0;i<CPU_LOADS.length;i++){
+    if(!available[CPU_LOADS[i]])clearCpuLoad(CPU_LOADS[i]);
+  }
+  for(var i=0;i<list.length;i++){
+    var m=list[i];
+    if(CPU_LOADS.indexOf(m.key)!==-1&&!available[m.key])continue;
     if(m.kind==='text'){
       if(m.text!==null&&m.text!==undefined)window.__setSlot(m.key,String(m.text));
       continue;
@@ -357,15 +376,27 @@ function apply(list,cfg){
     window.__setSlot(m.key,String(tgt?conv(m.value,m.unit,tgt):m.value));
   }
 }
+function request(url){
+  var controller=new AbortController();
+  var timeout=setTimeout(function(){controller.abort();},4000);
+  return fetch(url,{cache:'no-store',signal:controller.signal}).then(function(r){
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    return r.json();
+  }).catch(function(){return null;}).finally(function(){clearTimeout(timeout);});
+}
 var t=setInterval(function(){
   if(typeof window.__setSlot!=='function')return;
   clearInterval(t);
+  clearCpuLoads();
   (function p(){
     scan();
-    var a=fetch(MURL,{cache:'no-store'}).then(function(r){return r.json();}).catch(function(){return null;});
-    var b=fetch(UURL,{cache:'no-store'}).then(function(r){return r.json();}).catch(function(){return null;});
-    Promise.all([a,b]).then(function(res){ if(res[0])apply(res[0],res[1]); });
-    setTimeout(p,1000);
+    Promise.all([request(MURL),request(UURL)]).then(function(res){
+      if(Array.isArray(res[0]))apply(res[0],res[1]);
+      else clearCpuLoads();
+    }).catch(function(){clearCpuLoads();}).finally(function(){
+      // 故障请求有超时，且上一轮结束后才调度下一轮，避免堆积与旧响应覆盖。
+      setTimeout(p,1000);
+    });
   })();
 },100);
 })();"#;

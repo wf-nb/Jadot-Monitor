@@ -21,6 +21,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
+use std::time::Duration;
 
 /// 面板网页调用本地 API 的端口。
 pub const PORT: u16 = 8766;
@@ -43,6 +44,9 @@ pub fn spawn() {
 }
 
 fn handle(mut s: TcpStream) -> std::io::Result<()> {
+    // 本地空连接不能永久占用串行API线程；不改变指标采样或并发模型。
+    s.set_read_timeout(Some(Duration::from_secs(2)))?;
+    s.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut buf = [0u8; 4096];
     let n = s.read(&mut buf)?;
     let req = String::from_utf8_lossy(&buf[..n]);

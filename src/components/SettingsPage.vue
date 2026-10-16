@@ -12,6 +12,10 @@ const {
   logging,
   highFps,
   hybridCompat,
+  settingsError,
+  settingsSaving,
+  settingsReady,
+  loadSettings,
   unitMode,
   unitCapacity,
   unitRate,
@@ -26,6 +30,14 @@ interface LhwsState {
   version: string;
   installed: boolean;
   running: boolean;
+  /** SCM 里的真实服务状态：notInstalled / stopped / startPending / running / stopPending / paused / unknown */
+  serviceState: string;
+  /** 共享内存是否存在（= 真在发布数据） */
+  publishing: boolean;
+  /** 合并态，界面直接显示：notInstalled / stopped / starting / running / unknown */
+  status: string;
+  /** 上面的中文文案 */
+  statusText: string;
   source: string;
   license: string;
   licenseUrl: string;
@@ -35,11 +47,29 @@ const lhws = ref<LhwsState | null>(null);
 const lhwsBusy = ref(false);
 const lhwsMsg = ref("");
 
-function stateText(s: LhwsState | null): string {
-  if (!s) return "检测中…";
-  if (s.running) return "运行中";
-  if (s.installed) return "已安装，未运行";
-  return "未安装";
+/// 状态色：ok=绿（正常）· warn=黄（装好了但没在跑，可一键修）· off=灰（未安装）
+function stateClass(s: LhwsState | null): string {
+  if (!s) return "off";
+  if (s.status === "running") return "ok";
+  if (s.status === "notInstalled") return "off";
+  return "warn";
+}
+
+/// 状态下方的一句解释（点明"装好了但没在跑"和"没装"的区别）
+function stateHint(s: LhwsState | null): string {
+  if (!s) return "";
+  switch (s.status) {
+    case "running":
+      return "服务在跑并在发布数据。";
+    case "starting":
+      return "服务进程已启动，但还没发布数据（初始化通常 5~7 秒）。稍等，或点「重新启动」。";
+    case "stopped":
+      return "服务已安装，但进程没在运行 —— 点「重新启动」即可拉起（会弹一次 UAC）。";
+    case "notInstalled":
+      return "未安装。装好后才有温度 / 功耗 / 风扇等指标（网络与磁盘容量不受影响）。";
+    default:
+      return "拿不到服务状态，可点「重新检测」。";
+  }
 }
 
 async function refreshLhws() {
@@ -56,10 +86,42 @@ async function installLhws() {
   lhwsMsg.value = "正在下载并安装（会弹一次 UAC）…";
   try {
     lhws.value = await invoke<LhwsState>("lhws_install");
-    lhwsMsg.value = "安装完成";
+    lhwsMsg.value = lhws.value.running ? "" : "安装已完成，但服务还没在发布数据 —— 可点「重新启动」。";
   } catch (e) {
     lhwsMsg.value = `安装失败：${e}`;
   } finally {
+    lhwsBusy.value = false;
+  }
+}
+
+/// 重新启动服务（停 → 起 → 等数据就绪）。失败也要刷新状态，让用户看到真实情况。
+async function restartLhws() {
+  lhwsBusy.value = true;
+  lhwsMsg.value = "正在重新启动服务（会弹一次 UAC，请确认）…";
+  try {
+    lhws.value = await invoke<LhwsState>("lhws_restart");
+    lhwsMsg.value = "";
+  } catch (e) {
+    lhwsMsg.value = String(e);
+  } finally {
+    await refreshLhws();
+    lhwsBusy.value = false;
+  }
+}
+
+async function uninstallLhws() {
+  if (!confirm("确定要卸载 LibreHardwareService 吗？\n\n卸载后温度 / 功耗 / 风扇等指标将不可用（网络、磁盘容量仍正常）。")) {
+    return;
+  }
+  lhwsBusy.value = true;
+  lhwsMsg.value = "正在卸载（会弹一次 UAC）…";
+  try {
+    lhws.value = await invoke<LhwsState>("lhws_uninstall");
+    lhwsMsg.value = "已卸载";
+  } catch (e) {
+    lhwsMsg.value = `卸载失败：${e}`;
+  } finally {
+    await refreshLhws();
     lhwsBusy.value = false;
   }
 }
@@ -73,6 +135,9 @@ onMounted(() => {
 
 <template>
   <div>
+    <p v-if="settingsSaving" class="hint" role="status" aria-live="polite">正在保存设置…</p>
+    <p v-if="settingsError" class="err" role="alert">{{ settingsError }}</p>
+    <button v-if="!settingsReady && settingsError" @click="loadSettings">重新读取设置</button>
     <div class="card">
       <h2><Icon icon="line-md:play" />启动</h2>
       <div class="row">
@@ -110,15 +175,15 @@ onMounted(() => {
         抓屏节奏与最终下发节奏保持一致，改完立即生效。
       </p>
       <div class="row">
-        <span class="lbl">大小核兼容模式</span>
+        <span class="lbl">CPU 占用率自算（PDH）</span>
         <label class="sw">
-          <input type="checkbox" v-model="hybridCompat" />
+          <input type="checkbox" v-model="hybridCompat" :disabled="settingsSaving || !settingsReady" />
         </label>
       </div>
       <p class="hint">
-        仅 <b>Intel 大小核（P 核 + E 核）</b>机型需要开启：开启后额外统计 <b>P 核 / E 核</b>
-        两组占用率（P/E 分别平均）。总数不变 —— 仍与任务管理器口径一致。
-        同构核机型（如 AMD 全大核）请保持关闭。
+        关：使用 LibreHardwareService（LHS）的 CPU 总占用率，不输出 P/E 分组。
+        开：改用 PDH 自算总占用率，并在支持的大小核机型上输出 P 核 / E 核分组。
+        切换后须等待后台确认及新来源采样预热；未就绪或分组不可用时显示「—」，不沿用旧值或补成 0。
       </p>
     </div>
 
@@ -185,21 +250,27 @@ onMounted(() => {
       <h2><Icon icon="line-md:cloud-alt-download" />数据源</h2>
       <div class="row">
         <span class="lbl">LibreHardwareService</span>
-        <span class="val">{{ stateText(lhws) }}</span>
+        <span class="dot" :class="stateClass(lhws)"></span>
+        <span class="val">{{ lhws ? lhws.statusText : "检测中…" }}</span>
       </div>
-      <div class="btns two">
-        <button class="primary" @click="installLhws" :disabled="lhwsBusy || !!lhws?.running">
-          {{ lhwsBusy ? "安装中…" : "一键安装" }}
+      <div class="btns" :class="{ two: !lhws?.installed }">
+        <button v-if="!lhws?.installed" class="primary" @click="installLhws" :disabled="lhwsBusy">
+          {{ lhwsBusy ? "处理中…" : "一键安装" }}
+        </button>
+        <button v-else @click="restartLhws" :disabled="lhwsBusy">
+          {{ lhwsBusy ? "处理中…" : "重新启动" }}
         </button>
         <button @click="refreshLhws" :disabled="lhwsBusy">重新检测</button>
+        <button v-if="lhws?.installed" class="danger" @click="uninstallLhws" :disabled="lhwsBusy">卸载</button>
       </div>
+      <p v-if="lhws && !lhwsBusy" class="hint">{{ stateHint(lhws) }}</p>
       <p v-if="lhwsMsg" class="hint">{{ lhwsMsg }}</p>
       <p class="hint">
         第三方开源组件 {{ lhws?.version }}（{{ lhws?.license }}）·
         <a @click="openUrl(lhws?.source || '')">来源</a> ·
         <a @click="openUrl(lhws?.licenseUrl || '')">许可</a>
       </p>
-      <p class="hint">安装时系统会弹一次 UAC；不修改该组件的任何文件。</p>
+      <p class="hint">安装 / 重新启动 / 卸载都会弹一次 UAC；不修改该组件的任何文件。</p>
     </div>
 
     <div class="card">

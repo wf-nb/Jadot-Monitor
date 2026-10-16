@@ -1,14 +1,9 @@
 //! 数据源之二：**LibreHardwareService**（第三方组件，MPL-2.0）—— 读它的共享内存。
 //!
-//! 独立文件：只用 Win32 映射 + `serde_json`（**不新增依赖**）。服务没装/没跑 → 返回 `None`，上层自动回退。
+//! 独立文件：使用 Win32 共享内存映射与 `serde_json`，不新增依赖。
+//! 读取失败或没有有效传感器时返回 `None`，由上层补齐缺值。
 //!
-//! 两个要点：
-//! - 它的 **data 块恒定是 JSON**（每个传感器对象后跟一个 0x00 分隔），与 `indexFormat` 配置无关
-//!   → 我们**不需要改它的配置、也不需要 MessagePack**。
-//! - 它给的是 LibreHardwareMonitor 的**通用名**（`Fan #1`、`CPU Total`…），没有主板厂标签，
-//!   所以这里按 `hardwareType + name` 匹配；`fan` 用小值启发式区分 "%（显卡）" 与 "RPM（主板）"。
-//!
-//! **弃用这一路 = 删本文件 + `metrics.rs::basic()` 里两行。**
+//! data 段按 0x00 分隔的 JSON 传感器对象解析，按硬件类型、传感器类型和名称映射指标。
 
 use std::sync::Mutex;
 
@@ -30,95 +25,150 @@ pub fn available() -> bool {
     crate::lhws_install::running()
 }
 
-/// 读一段共享内存：拿互斥体 → 映射 → 只复制 data 段 → 释放。
+const MAX_MAPPING_BYTES: usize = 64 * 1024 * 1024;
+
+/// 所有偏移都限制在映射和本地读取上限内，先检查加法再访问内存。
+fn checked_range(off: usize, len: usize, cap: usize) -> Result<std::ops::Range<usize>, String> {
+    let end = off.checked_add(len).ok_or("共享内存偏移溢出")?;
+    let limit = cap.min(MAX_MAPPING_BYTES).min(isize::MAX as usize);
+    if end > limit {
+        return Err(format!("共享内存越界（off={off} len={len} cap={limit}）"));
+    }
+    Ok(off..end)
+}
+
+fn mapping_capacity(view: usize, region: usize, size: usize) -> Result<usize, String> {
+    let end = region.checked_add(size).ok_or("共享内存区域地址溢出")?;
+    if view < region || view >= end {
+        return Err("映射地址不在 VirtualQuery 返回的区域内".into());
+    }
+    Ok((end - view).min(MAX_MAPPING_BYTES).min(isize::MAX as usize))
+}
+
+/// 仅解析长度与偏移，不访问 FFI；data 偏移相对于映射起点。
+fn data_block_range(block: &[u8]) -> Result<std::ops::Range<usize>, String> {
+    let rd = |off: usize| -> Result<u32, String> {
+        let bytes = block.get(checked_range(off, 4, block.len())?).ok_or("头部不完整")?;
+        let bytes: [u8; 4] = bytes.try_into().map_err(|_| "头部不完整")?;
+        Ok(u32::from_le_bytes(bytes))
+    };
+    let meta_len = rd(0)? as usize;
+    let hdr = checked_range(4, meta_len, block.len())?.end;
+    let header_end = checked_range(hdr, 20, block.len())?.end;
+    let len_off = hdr.checked_add(12).ok_or("data-length 偏移溢出")?;
+    let off_off = hdr.checked_add(16).ok_or("data-offset 偏移溢出")?;
+    let data_len = rd(len_off)? as usize;
+    let data_off = rd(off_off)? as usize;
+    if data_len == 0 || data_off < header_end {
+        return Err(format!("data 段为空或与头部重叠（off={data_off} len={data_len}）"));
+    }
+    checked_range(data_off, data_len, block.len())
+}
+
+/// 读一段共享内存：必须持有互斥体，映射和句柄通过 RAII 释放。
 unsafe fn read_data_block() -> Result<Vec<u8>, String> {
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, GetLastError, HANDLE,
+        WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
     use windows_sys::Win32::System::Memory::{
-        FILE_MAP_READ, MEMORY_BASIC_INFORMATION, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile,
-        VirtualQuery,
+        FILE_MAP_READ, MEM_COMMIT, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
+        MapViewOfFile, OpenFileMappingW, PAGE_GUARD, PAGE_NOACCESS, UnmapViewOfFile, VirtualQuery,
     };
     use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
     use windows_sys::Win32::System::Threading::{OpenMutexW, ReleaseMutex, WaitForSingleObject};
 
-    let mtx = unsafe { OpenMutexW(SYNCHRONIZE, 0, wide(MUTEX).as_ptr()) };
-    let mut locked = false;
-    if !mtx.is_null() && unsafe { WaitForSingleObject(mtx, 2000) } == 0 {
-        locked = true;
+    struct Handle(HANDLE);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
     }
-    let result = (|| -> Result<Vec<u8>, String> {
-        let map = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, wide(MMF).as_ptr()) };
-        if map.is_null() {
-            // **必须分清「真的不存在」与「存在但打不开」**——两者根因完全不同：
-            //   · 不存在（2）：服务进程没跑，**或者刚启动、硬件还没枚举完、尚未发布共享内存**；
-            //   · 打不开（5）：映射在，但权限 / 会话 / 命名空间不通。
-            // 以前一律报「服务未运行」，会把排查方向带偏（服务其实是 Running）。
-            use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, GetLastError};
-            let code = unsafe { GetLastError() };
-            return Err(match code {
-                ERROR_FILE_NOT_FOUND => {
-                    "共享内存不存在（服务进程未运行，或刚启动尚未发布数据）".to_string()
-                }
-                ERROR_ACCESS_DENIED => "共享内存打不开（权限不足，错误 5）".to_string(),
-                c => format!("共享内存打不开（错误 {c}）"),
-            });
-        }
-        let view = unsafe { MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0) };
-        if view.Value.is_null() {
-            unsafe { CloseHandle(map) };
-            return Err("映射共享内存失败".into());
-        }
-        let out = (|| -> Result<Vec<u8>, String> {
-            // 映射区大小（不能越过它读，否则访问违例）
-            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-            let got = unsafe {
-                VirtualQuery(
-                    view.Value as *const core::ffi::c_void,
-                    &mut mbi,
-                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-                )
-            };
-            let cap = if got == 0 { 1 << 20 } else { mbi.RegionSize };
-            let base = view.Value as *const u8;
-            let rd = |off: usize| -> Option<u32> {
-                if off + 4 > cap {
-                    return None;
-                }
-                Some(u32::from_ne_bytes(unsafe {
-                    *(base.add(off) as *const [u8; 4])
-                }))
-            };
-            let meta_len = rd(0).ok_or("头部不完整")? as usize;
-            let hdr = 4 + meta_len;
-            let data_len = rd(hdr + 12).ok_or("头部不完整（data-length）")? as usize;
-            let data_off = rd(hdr + 16).ok_or("头部不完整（data-offset）")? as usize;
-            if data_len == 0 || data_off + data_len > cap {
-                return Err(format!("data 段越界（off={data_off} len={data_len} cap={cap}）"));
+
+    struct MutexGuard(Handle);
+    impl Drop for MutexGuard {
+        fn drop(&mut self) {
+            if unsafe { ReleaseMutex(self.0.0) } == 0 {
+                let code = unsafe { GetLastError() };
+                crate::logging::warn(&format!(
+                    "LibreHardwareService 释放互斥体失败（ReleaseMutex 错误 {code}）"
+                ));
             }
-            Ok(unsafe { std::slice::from_raw_parts(base.add(data_off), data_len) }.to_vec())
-        })();
-        unsafe {
-            UnmapViewOfFile(view);
-            CloseHandle(map);
-        }
-        out
-    })();
-    unsafe {
-        if locked {
-            ReleaseMutex(mtx);
-        }
-        if !mtx.is_null() {
-            CloseHandle(mtx);
         }
     }
-    result
+
+    struct View(MEMORY_MAPPED_VIEW_ADDRESS);
+    impl Drop for View {
+        fn drop(&mut self) {
+            unsafe { UnmapViewOfFile(self.0) };
+        }
+    }
+
+    let mtx = unsafe { OpenMutexW(SYNCHRONIZE, 0, wide(MUTEX).as_ptr()) };
+    if mtx.is_null() {
+        let code = unsafe { GetLastError() };
+        return Err(format!("互斥体打不开（OpenMutexW 错误 {code}）"));
+    }
+    let mtx = Handle(mtx);
+    match unsafe { WaitForSingleObject(mtx.0, 2000) } {
+        WAIT_OBJECT_0 | WAIT_ABANDONED => {}
+        WAIT_TIMEOUT => return Err("等待读取互斥体超时（WAIT_TIMEOUT）".into()),
+        WAIT_FAILED => {
+            let code = unsafe { GetLastError() };
+            return Err(format!("等待读取互斥体失败（WAIT_FAILED，错误 {code}）"));
+        }
+        status => return Err(format!("等待读取互斥体返回异常状态（{status}）")),
+    }
+    // WAIT_ABANDONED 同样取得所有权；仍须验证映射、头部和数据，并最终释放。
+    let _lock = MutexGuard(mtx);
+    let map = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, wide(MMF).as_ptr()) };
+    if map.is_null() {
+        let code = unsafe { GetLastError() };
+        return Err(match code {
+            ERROR_FILE_NOT_FOUND => {
+                "共享内存不存在（服务进程未运行，或刚启动尚未发布数据）".to_string()
+            }
+            ERROR_ACCESS_DENIED => "共享内存打不开（权限不足，错误 5）".to_string(),
+            c => format!("共享内存打不开（错误 {c}）"),
+        });
+    }
+    let map = Handle(map);
+    let view = unsafe { MapViewOfFile(map.0, FILE_MAP_READ, 0, 0, 0) };
+    if view.Value.is_null() {
+        let code = unsafe { GetLastError() };
+        return Err(format!("映射共享内存失败（错误 {code}）"));
+    }
+    let view = View(view);
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let got = unsafe {
+        VirtualQuery(
+            view.0.Value as *const core::ffi::c_void,
+            &mut mbi,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if got == 0 {
+        let code = unsafe { GetLastError() };
+        return Err(format!("查询共享内存区域失败（VirtualQuery 错误 {code}）"));
+    }
+    if got != std::mem::size_of::<MEMORY_BASIC_INFORMATION>()
+        || mbi.State != MEM_COMMIT
+        || mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS) != 0
+    {
+        return Err("共享内存区域信息不完整或不可读".into());
+    }
+    let cap = mapping_capacity(view.0.Value as usize, mbi.BaseAddress as usize, mbi.RegionSize)?;
+    let block = unsafe { std::slice::from_raw_parts(view.0.Value as *const u8, cap) };
+    let range = data_block_range(block)?;
+    Ok(block[range].to_vec())
 }
 
-/// 调试用：把共享内存里的**全部**传感器原样吐成 JSON（`--dump-lhws`）。
+/// 调试用：把共享内存里解析有效的数值传感器输出为 JSON（`--dump-lhws`）。
 /// 某个指标对不上时先看这里——有没有这条传感器、原始值是多少、归属哪块硬件。
 pub fn dump_raw_json() -> String {
     let d = match unsafe { read_data_block() } {
         Ok(d) => d,
-        Err(e) => return format!("{{\"error\": \"{e}\"}}"),
+        Err(e) => return serde_json::json!({ "error": e }).to_string(),
     };
     let arr: Vec<serde_json::Value> = parse(&d)
         .iter()
@@ -133,7 +183,8 @@ pub fn dump_raw_json() -> String {
             })
         })
         .collect();
-    serde_json::to_string_pretty(&arr).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+    serde_json::to_string_pretty(&arr)
+        .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }).to_string())
 }
 
 struct S {
@@ -171,6 +222,9 @@ fn parse(data: &[u8]) -> Vec<S> {
             continue;
         }
         let Ok(v) = serde_json::from_slice::<Value>(t) else { continue };
+        let Some(value) = v.get("value").and_then(Value::as_f64).filter(|v| v.is_finite()) else {
+            continue;
+        };
         let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
         out.push(S {
             identifier: g("identifier"),
@@ -178,10 +232,24 @@ fn parse(data: &[u8]) -> Vec<S> {
             sensor_type: g("sensorType"),
             hw_name: g("hardwareName"),
             hw_type: g("hardwareType"),
-            value: v.get("value").and_then(|x| x.as_f64()).unwrap_or(0.0),
+            value,
         });
     }
     out
+}
+
+/// 只选择 CPU 的整体负载，不把核心、线程或其他带 total 的名称当作整体负载。
+fn select_cpu_load(sensors: &[S]) -> Option<f64> {
+    sensors
+        .iter()
+        .find(|s| {
+            s.hw_type.eq_ignore_ascii_case("Cpu")
+                && s.is("Load")
+                && s.name.eq_ignore_ascii_case("CPU Total")
+                && s.value.is_finite()
+                && s.value >= 0.0
+        })
+        .map(|s| s.value.min(100.0))
 }
 
 /// 数据源故障的合并状态：`Some((原因, 已抑制条数))`。
@@ -192,9 +260,9 @@ static FAIL: Mutex<Option<(String, u64)>> = Mutex::new(None);
 
 /// 记录一次失败：同一原因只记第一条，后续只累计；原因变化时另起一条。
 fn note_fail(reason: &str) {
-    let mut g = FAIL.lock().unwrap();
+    let mut g = FAIL.lock().unwrap_or_else(|e| e.into_inner());
     match g.clone() {
-        Some((r, n)) if r == reason => *g = Some((r, n + 1)),
+        Some((r, n)) if r == reason => *g = Some((r, n.saturating_add(1))),
         Some((r, n)) => {
             *g = Some((reason.to_string(), 1));
             drop(g);
@@ -214,7 +282,7 @@ fn note_fail(reason: &str) {
 
 /// 记录一次成功：若之前在故障中，汇总一条「已恢复」（带抑制了多少次采样）。
 fn note_ok() {
-    let hit = FAIL.lock().unwrap().take();
+    let hit = FAIL.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some((reason, n)) = hit {
         crate::logging::info(&format!(
             "LibreHardwareService 已恢复（此前「{reason}」连续 {n} 次采样未取到，日志已抑制）"
@@ -222,13 +290,11 @@ fn note_ok() {
     }
 }
 
-/// 读一遍并映射成指标；读不到返回 `None`。
+/// 读一遍并映射成指标；读取失败或没有有效传感器时返回 `None`，由 metrics 补齐缺值。
+/// 成功结果始终包含 LHS 的 cpu_load（有效值或 None）；自算模式由 metrics 过滤该项。
 pub fn read() -> Option<Vec<BasicMetric>> {
     let data = match unsafe { read_data_block() } {
-        Ok(d) => {
-            note_ok();
-            d
-        }
+        Ok(d) => d,
         Err(e) => {
             note_fail(&e);
             return None;
@@ -236,8 +302,10 @@ pub fn read() -> Option<Vec<BasicMetric>> {
     };
     let ss = parse(&data);
     if ss.is_empty() {
+        note_fail("共享内存中没有有效传感器数据");
         return None;
     }
+    note_ok();
     let mut out: Vec<BasicMetric> = Vec::new();
     let src = |s: &S| format!("LHS: {}", s.identifier);
 
@@ -256,11 +324,16 @@ pub fn read() -> Option<Vec<BasicMetric>> {
             .find(|s| s.hw_type == "Cpu" && f(s))
             .map(|s| s.value)
     };
-    // **`cpu_load` 不在这里出**：LHM 的 `CPU Total` 用
-    // `SystemProcessorPerformanceInformation.IdleTime` 算占用，该字段在 Windows 11 上无效 →
-    // 占用率严重偏低（上游 PR #933 给了绕行方案，LHS 打包的版本未包含）。
-    // 我们改为**自算**（`cpu_usage.rs`：PDH `% Processor Utility` 为主 + `GetSystemTimes` 兜底），
-    // 由 `metrics::basic()` 统一出项 —— 顺带也不再随 LHS 瞬断而缺项。
+    push(
+        &mut out,
+        "CPU",
+        "cpu_load",
+        "CPU 占用率",
+        "%",
+        1,
+        select_cpu_load(&ss),
+        "LHS: CPU Total",
+    );
     let temp = cpu(&|s| s.is("Temperature") && (s.has("tctl") || s.has("tdie") || s.has("package")))
         .or_else(|| {
             ss.iter()
@@ -426,4 +499,137 @@ pub fn read() -> Option<Vec<BasicMetric>> {
     // ---------- 共用的 Win32 项 ----------
     win32_fill(&mut out);
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_MAPPING_BYTES, S, checked_range, data_block_range, mapping_capacity, parse, select_cpu_load};
+
+    fn sensor(hw_type: &str, sensor_type: &str, name: &str, value: f64) -> S {
+        S {
+            identifier: "/test/load/0".into(),
+            name: name.into(),
+            sensor_type: sensor_type.into(),
+            hw_name: "测试硬件".into(),
+            hw_type: hw_type.into(),
+            value,
+        }
+    }
+
+    fn block(meta: &[u8], data: &[u8]) -> Vec<u8> {
+        let hdr = 4 + meta.len();
+        let off = hdr + 20;
+        let mut out = vec![0; off];
+        out[..4].copy_from_slice(&(meta.len() as u32).to_le_bytes());
+        out[4..hdr].copy_from_slice(meta);
+        out[hdr + 12..hdr + 16].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        out[hdr + 16..hdr + 20].copy_from_slice(&(off as u32).to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    #[test]
+    fn parse_preserves_zero_and_skips_invalid_values() {
+        let data = b" \n{\"name\":\"zero\",\"value\":0}\0{\"value\":null}\0{}\0{\"value\":\"12\"}\0{\"value\":1e999}\0{\"value\":NaN}\0{broken}\0[]\0{\"name\":\"negative\",\"value\":-2.5}\0";
+        let sensors = parse(data);
+        assert_eq!(sensors.len(), 2);
+        assert_eq!(sensors[0].name, "zero");
+        assert_eq!(sensors[0].value, 0.0);
+        assert_eq!(sensors[1].value, -2.5);
+        assert!(parse(b" \0{\"value\":null}\0").is_empty());
+    }
+
+    #[test]
+    fn parse_maps_sensor_fields() {
+        let sensors = parse(br#"{"identifier":"/cpu/0/load/0","name":"CPU Total","sensorType":"Load","hardwareName":"CPU","hardwareType":"Cpu","value":42.5}"#);
+        assert_eq!(sensors.len(), 1);
+        let s = &sensors[0];
+        assert_eq!(s.identifier, "/cpu/0/load/0");
+        assert_eq!(s.hw_name, "CPU");
+        assert_eq!(s.hw_type, "Cpu");
+        assert_eq!(s.sensor_type, "Load");
+        assert_eq!(select_cpu_load(&sensors), Some(42.5));
+    }
+
+    #[test]
+    fn cpu_load_requires_exact_case_insensitive_match() {
+        let sensors = vec![
+            sensor("Cpu", "Load", "Total", 11.0),
+            sensor("Cpu", "Load", "CPU Total Average", 12.0),
+            sensor("GpuIntel", "Load", "CPU Total", 13.0),
+            sensor("Cpu", "Temperature", "CPU Total", 14.0),
+            sensor("Cpu", "Load", "CPU Core #1", 15.0),
+            sensor("cPu", "lOaD", "cPu tOtAl", 42.0),
+        ];
+        assert_eq!(select_cpu_load(&sensors), Some(42.0));
+        assert_eq!(select_cpu_load(&sensors[..5]), None);
+        assert_eq!(select_cpu_load(&[]), None);
+    }
+
+    #[test]
+    fn cpu_load_rejects_invalid_values_and_clamps_valid_values() {
+        let mut sensors = vec![
+            sensor("Cpu", "Load", "CPU Total", f64::NAN),
+            sensor("Cpu", "Load", "CPU Total", f64::INFINITY),
+            sensor("Cpu", "Load", "CPU Total", f64::NEG_INFINITY),
+            sensor("Cpu", "Load", "CPU Total", -1.0),
+        ];
+        assert_eq!(select_cpu_load(&sensors), None);
+        sensors.push(sensor("Cpu", "Load", "CPU Total", 0.0));
+        assert_eq!(select_cpu_load(&sensors), Some(0.0));
+        sensors.last_mut().unwrap().value = 150.0;
+        assert_eq!(select_cpu_load(&sensors), Some(100.0));
+    }
+
+    #[test]
+    fn ranges_check_exact_end_overflow_and_capacity_limit() {
+        assert_eq!(checked_range(12, 4, 16).unwrap(), 12..16);
+        assert!(checked_range(13, 4, 16).is_err());
+        assert!(checked_range(usize::MAX, 1, usize::MAX).is_err());
+        assert!(checked_range(MAX_MAPPING_BYTES, 1, usize::MAX).is_err());
+        assert_eq!(checked_range(0, MAX_MAPPING_BYTES, usize::MAX).unwrap(), 0..MAX_MAPPING_BYTES);
+    }
+
+    #[test]
+    fn mapping_capacity_checks_region_and_limits_read_size() {
+        assert_eq!(mapping_capacity(104, 100, 16).unwrap(), 12);
+        assert_eq!(mapping_capacity(0, 0, MAX_MAPPING_BYTES + 1).unwrap(), MAX_MAPPING_BYTES);
+        assert!(mapping_capacity(99, 100, 16).is_err());
+        assert!(mapping_capacity(116, 100, 16).is_err());
+        assert!(mapping_capacity(100, 100, 0).is_err());
+        assert!(mapping_capacity(usize::MAX, usize::MAX - 1, 4).is_err());
+    }
+
+    #[test]
+    fn data_range_accepts_metadata_and_exact_end() {
+        let data = b"{\"value\":1}\0";
+        let bytes = block(b"{}", data);
+        let range = data_block_range(&bytes).unwrap();
+        assert_eq!(range.end, bytes.len());
+        assert_eq!(&bytes[range], data);
+    }
+
+    #[test]
+    fn data_range_rejects_truncated_header_or_payload() {
+        assert!(data_block_range(&[]).is_err());
+        assert!(data_block_range(&[0; 3]).is_err());
+        let bytes = block(&[], b"x");
+        assert!(data_block_range(&bytes[..23]).is_err());
+        assert!(data_block_range(&bytes[..24]).is_err());
+        assert!(data_block_range(&u32::MAX.to_le_bytes()).is_err());
+    }
+
+    #[test]
+    fn data_range_rejects_empty_overlap_and_extreme_lengths() {
+        assert!(data_block_range(&block(&[], &[])).is_err());
+        let mut bytes = block(&[], b"x");
+        bytes[20..24].copy_from_slice(&0u32.to_le_bytes());
+        assert!(data_block_range(&bytes).is_err());
+        bytes[20..24].copy_from_slice(&24u32.to_le_bytes());
+        bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(data_block_range(&bytes).is_err());
+        bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(data_block_range(&bytes).is_err());
+    }
 }

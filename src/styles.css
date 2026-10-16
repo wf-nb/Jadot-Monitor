@@ -22,6 +22,7 @@ body {
   --btn-hover: #262e3b;
   --danger: #f87171;
   --ok: #34d399;
+  --warn: #fbbf24;
   /* 圆角统一三档：小标签 / 控件 / 容器；圆形与胶囊另算（50% / 999px） */
   --r-xs: 4px;
   --r-sm: 6px;
@@ -47,6 +48,7 @@ body {
   --btn-hover: #e2e8f0;
   --danger: #dc2626;
   --ok: #059669;
+  --warn: #d97706;
 }
 /* 自定义标题栏（原生标题栏已隐藏） */
 .titlebar {
@@ -204,6 +206,15 @@ body {
 }
 .dot.ok {
   background: var(--ok);
+}
+/* 装好了但没在跑（可一键「重新启动」修好） */
+.dot.warn {
+  background: var(--warn);
+}
+/* 未安装 */
+.dot.off {
+  background: var(--sub);
+  opacity: 0.45;
 }
 .mini {
   margin-left: auto;

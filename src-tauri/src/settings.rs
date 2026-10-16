@@ -36,9 +36,8 @@ pub struct Settings {
     pub silent_start: bool,
     pub logging: bool,
     pub high_fps: bool,
-    /// 大小核兼容模式：**手动**开启，仅 Intel P+E 混合核机型需要。
-    /// 开启后按大小核口径**分组统计** P 核 / E 核占用率（额外出 `cpu_load_p` / `cpu_load_e`），
-    /// 总数 `cpu_load` 不变（仍是与任务管理器一致的等权平均）。同构核机型保持关闭。
+    /// 手动切换 CPU 数据源：关闭用 LHS CPU Total；开启才使用 PDH/系统时间自算。
+    /// 开启后可额外输出 P/E 分组；同构核不输出分组但仍遵守手动选择。
     pub hybrid_compat: bool,
     pub theme: String,
     pub close_to_tray: bool,
@@ -127,8 +126,8 @@ impl Settings {
              logging={}\n\
              ; 高刷模式：1 = 面板 / 预览 ~30fps，0 = 普通 ~10fps（省 CPU）\n\
              high_fps={}\n\
-             ; 大小核兼容模式：仅 Intel 大小核（P 核 + E 核）机型需要开启；\n\
-             ; 开启后按大小核口径分组统计 P 核 / E 核占用率（同构核机型请保持 0）\n\
+             ; 大小核兼容模式：0 = LHS CPU Total，1 = 自算 CPU 占用率；\n\
+             ; 手动开启；切换后自算需重新采样，缺值显示不可用，不跨模式回退\n\
              hybrid_compat={}\n\
              \n\
              [ui]\n\
@@ -180,6 +179,7 @@ fn truthy(v: &str) -> bool {
 /// 解析 INI → `section.key`（小写）→ 值。
 fn parse(text: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
+    let text = text.trim_start_matches('\u{feff}');
     let mut section = String::new();
     for raw in text.lines() {
         let line = raw.trim();
@@ -202,6 +202,8 @@ fn parse(text: &str) -> HashMap<String, String> {
 }
 
 static CURRENT: Mutex<Option<Settings>> = Mutex::new(None);
+// 覆盖读-改-写及运行态提交，避免共用临时文件和旧快照互相覆盖。
+static TRANSACTION: Mutex<()> = Mutex::new(());
 
 /// 旧的标记文件（本次迁移前的形态），存在就把它的语义搬进 `settings.ini`。
 /// 迁移只做一次：写出的 ini 里有值，之后就不再看这两个文件。
@@ -223,6 +225,14 @@ fn migrate_legacy() -> Option<Settings> {
 /// 文件不存在时会**顺手写一份出来**（含从旧标记文件 `silent.flag` / `nolog.flag` 迁移来的值），
 /// 之后就以 `settings.ini` 为准。
 pub fn load() -> Settings {
+    let _transaction = TRANSACTION.lock().unwrap_or_else(|e| e.into_inner());
+    load_locked()
+}
+
+fn load_locked() -> Settings {
+    if let Some(s) = CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return s;
+    }
     let from_file = path().and_then(|p| std::fs::read_to_string(&p).ok());
     let (s, need_write) = match from_file {
         Some(text) => (Settings::from_map(&parse(&text)), false),
@@ -247,9 +257,7 @@ pub fn current() -> Settings {
 
 /// 写回：**原子写**（先写 `.tmp` 再替换，避免写一半断电留下坏文件）。
 fn write_file(s: &Settings) -> Result<(), String> {
-    let Some(p) = path() else {
-        return Ok(()); // 拿不到路径（理论上不会）：内存里生效即可
-    };
+    let p = path().ok_or("无法定位 settings.ini，设置未保存")?;
     let tmp = p.with_extension("ini.tmp");
     std::fs::write(&tmp, s.to_ini().as_bytes()).map_err(|e| format!("写 {} 失败：{e}", tmp.display()))?;
     std::fs::rename(&tmp, &p).map_err(|e| format!("替换 {} 失败：{e}", p.display()))?;
@@ -258,7 +266,27 @@ fn write_file(s: &Settings) -> Result<(), String> {
 
 /// 用一段 JSON 局部更新设置（只认传进来的键），写回文件并返回最新值。
 pub fn apply_patch(patch: &Value) -> Result<Settings, String> {
-    let mut s = current();
+    let _transaction = TRANSACTION.lock().unwrap_or_else(|e| e.into_inner());
+    let previous = load_locked();
+    let s = patched(&previous, patch);
+    // 只在成功落盘后提交运行态；相同快照不重复写盘。
+    if s != previous {
+        write_file(&s)?;
+    }
+    // 持 CURRENT 锁建立模式切换提交点；CPU worker 不在CPU锁内访问settings。
+    {
+        let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+        crate::cpu_usage::set_enabled(s.hybrid_compat);
+        *current = Some(s.clone());
+    }
+    crate::logging::set_enabled(s.logging);
+    crate::pipeline::set_high_fps(s.high_fps);
+    crate::units::set(s.unit_mode.clone(), s.units_map());
+    Ok(s)
+}
+
+fn patched(previous: &Settings, patch: &Value) -> Settings {
+    let mut s = previous.clone();
     let b = |k: &str, cur: bool| patch.get(k).and_then(|v| v.as_bool()).unwrap_or(cur);
     let t = |k: &str, cur: &str| {
         patch
@@ -286,9 +314,7 @@ pub fn apply_patch(patch: &Value) -> Result<Settings, String> {
     s.unit_temperature = t("unitTemp", &s.unit_temperature);
     s.unit_duration = t("unitDuration", &s.unit_duration);
 
-    write_file(&s)?;
-    *CURRENT.lock().unwrap() = Some(s.clone());
-    Ok(s)
+    s
 }
 
 /// 给前端的 JSON（键名与 `apply_patch` 一致）。
@@ -307,4 +333,35 @@ pub fn to_json(s: &Settings) -> Value {
         "unitTemp": s.unit_temperature,
         "unitDuration": s.unit_duration,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_mode_defaults_to_lhs() {
+        assert!(!Settings::default().hybrid_compat);
+        assert!(!Settings::from_map(&parse("[app]\n")).hybrid_compat);
+    }
+
+    #[test]
+    fn mode_ini_round_trip_and_bom() {
+        for enabled in [false, true] {
+            let s = Settings { hybrid_compat: enabled, ..Settings::default() };
+            assert_eq!(Settings::from_map(&parse(&s.to_ini())), s);
+        }
+        assert!(Settings::from_map(&parse("\u{feff}[app]\r\nhybrid_compat=1\r\n")).hybrid_compat);
+    }
+
+    #[test]
+    fn partial_patch_preserves_other_fields() {
+        let s = Settings { theme: "light".into(), high_fps: true, ..Settings::default() };
+        let enabled = patched(&s, &json!({"hybridCompat": true}));
+        assert!(enabled.hybrid_compat);
+        assert!(enabled.high_fps);
+        assert_eq!(enabled.theme, "light");
+        assert!(patched(&enabled, &json!({"hybridCompat": "false"})).hybrid_compat);
+        assert!(!patched(&enabled, &json!({"hybridCompat": false})).hybrid_compat);
+    }
 }
