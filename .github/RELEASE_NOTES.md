@@ -1,10 +1,10 @@
 <!--
   发版说明（Release 正文）
   每次发版前改这里；正文会原样放进 GitHub Release，末尾自动附上「本次包含的提交」列表。
-  版本号改这三处：package.json / src-tauri/tauri.conf.json / src-tauri/Cargo.toml（必须一致）。
+  版本号改这四处：package.json / src-tauri/tauri.conf.json / src-tauri/Cargo.toml / src-tauri/Cargo.lock（必须一致）。
 -->
 
-## v0.4.0 · CPU 取数改为可选自算 + 服务状态管理 + 设置保存可靠性
+## v0.5.0 · CPU 取数改为可选自算 + 服务状态管理 + 设置保存可靠性
 
 这一版把上一版引入的 **CPU 自算从「默认」改为「可选」**，并补上 LibreHardwareService 的
 状态管理、设置保存的失败回滚，以及一批取数与读取的健壮性修复。
@@ -65,7 +65,8 @@
 ### 其他
 
 - 本机 API 增加 2 秒读写超时，避免空连接占住串行处理线程。
-- 面板素材走本地文件，WebView2 补上 `--disable-web-security --allow-file-access-from-files`。
+- WebView2 启动参数保持最小集（只留 CDP 端口与遮挡开关）：**不再关闭浏览器安全策略**，
+  否则应用自身的前后端通信会失效（界面表现为「没反应」）。
 
 ### 升级提示
 

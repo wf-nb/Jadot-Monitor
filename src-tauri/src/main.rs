@@ -5,13 +5,19 @@ fn main() {
     // 给 app 自带的 WebView2 开 CDP 端口 —— 面板渲染直接复用 WebView2，不再另起一个 Edge。
     // 必须在 Tauri 初始化 WebView2 **之前**设。
     // `CalculateNativeWinOcclusion` 必须关：否则窗口被判为遮挡时 Chromium 会停渲染 → 抓不到帧。
+    //
+    // ⚠️ **不要加 `--disable-web-security`**：它会让 WebView2 不再发送 `Origin` 头，
+    // 而 Tauri IPC 强制校验 Origin（tauri/src/ipc/protocol.rs，缺了直接返回
+    // "missing Origin header"）→ 前端所有 invoke 全部失败、界面表现为「没反应」。
+    // 面板要 fetch 本地指标 API（file:// 页面 origin 为 null）靠的是 API 自己回的
+    // `Access-Control-Allow-Origin: *`（见 api.rs），与浏览器安全开关无关；
+    // 主题素材也是同目录自包含、无跨目录引用，因此也不需要 `--allow-file-access-from-files`。
     #[cfg(windows)]
     unsafe {
         std::env::set_var(
             "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
             format!(
-                "--remote-debugging-port={} --disable-features=CalculateNativeWinOcclusion \
-                 --disable-web-security --allow-file-access-from-files",
+                "--remote-debugging-port={} --disable-features=CalculateNativeWinOcclusion",
                 jiaidian_monitor_lib::PANEL_CDP_PORT
             ),
         );
