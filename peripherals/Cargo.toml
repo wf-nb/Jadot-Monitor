@@ -1,0 +1,16 @@
+[package]
+name = "peripherals"
+version = "0.1.0"
+edition = "2021"
+description = "Peripherals battery DLL component (mouse battery monitoring)"
+
+[lib]
+name = "peripherals"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+hidapi = "2.4"
+thiserror = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"

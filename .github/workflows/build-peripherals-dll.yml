@@ -1,0 +1,52 @@
+name: Build Peripherals DLL
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: peripherals
+
+      - name: Build peripherals.dll
+        working-directory: peripherals
+        run: cargo build --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: peripherals-dll
+          path: peripherals/target/release/peripherals.dll
+
+      - name: Update tag and release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $dll = "peripherals/target/release/peripherals.dll"
+          $tag = "peripherals-dll"
+
+          # Delete existing tag
+          git tag -d $tag 2>$null
+          git push origin :refs/tags/$tag 2>$null
+
+          # Create new tag
+          git tag $tag
+          git push origin $tag
+
+          # Delete existing release
+          gh release delete $tag --yes 2>$null
+
+          # Create new release
+          gh release create $tag `
+            --title "peripherals.dll" `
+            --notes "Automated build of peripherals.dll" `
+            $dll

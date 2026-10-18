@@ -9,18 +9,12 @@ const {
   silentStart,
   closeToTray,
   devtools,
-  logging,
   highFps,
   hybridCompat,
   settingsError,
   settingsSaving,
   settingsReady,
   loadSettings,
-  unitMode,
-  unitCapacity,
-  unitRate,
-  unitTemp,
-  unitDuration,
   toggleAutostart,
   openDevtools,
 } = useSettings();
@@ -128,9 +122,118 @@ async function uninstallLhws() {
 
 const openUrl = (url: string) => invoke("open_url", { url }).catch(() => {});
 
-onMounted(() => {
-  refreshLhws();
-});
+// ---- 外设电量 ----
+interface PeriDevice { vid: string; pid: string; enabled: boolean; label: string; }
+interface PeriConfig { devices: PeriDevice[]; }
+interface PeriDetected { vid: number; pid: number; usage_page: number; usage: number; product_string: string; supported: boolean; provider: string | null; }
+const periConfig = ref<PeriConfig>({ devices: [] });
+const periBusy = ref(false);
+const periMsg = ref("");
+const periDetected = ref<PeriDetected[]>([]);
+const periDllRunning = ref(false);
+
+async function loadPeri() {
+  try {
+    periConfig.value = await invoke<PeriConfig>("peripherals_get");
+    const raw = await invoke<PeriDetected[]>("peripherals_devices");
+    periDetected.value = raw;
+    const st = await invoke<{exists:boolean,loaded:boolean}>("peripherals_status");
+    const s = await invoke<any>("settings_get");
+    if (!st.exists) {
+      periDllRunning.value = false;
+      periMsg.value = "未找到 peripherals.dll（组件缺失）";
+    } else if (st.loaded) {
+      periDllRunning.value = true;
+    } else {
+      periDllRunning.value = s.peripheralsEnable || false;
+    }
+  } catch (e) { periMsg.value = String(e); }
+}
+
+async function startPeriDll() {
+  periBusy.value = true; periMsg.value = "";
+  try {
+    await invoke("settings_set", { patch: { peripheralsEnable: true } });
+    await invoke("peripherals_devices");
+    const st = await invoke<{exists:boolean,loaded:boolean}>("peripherals_status");
+    if (!st.exists) {
+      periDllRunning.value = false;
+      periMsg.value = "未找到 peripherals.dll（组件缺失）";
+    } else if (st.loaded) {
+      periDllRunning.value = true;
+      periMsg.value = "peripherals.dll 已启动";
+    } else {
+      periMsg.value = "peripherals.dll 加载失败";
+    }
+  } catch (e) { periMsg.value = String(e); }
+  finally { periBusy.value = false; }
+}
+
+async function stopPeriDll() {
+  periBusy.value = true; periMsg.value = "";
+  try {
+    await invoke("settings_set", { patch: { peripheralsEnable: false } });
+    periDllRunning.value = false;
+    periMsg.value = "peripherals.dll 已停止";
+  } catch (e) { periMsg.value = String(e); }
+  finally { periBusy.value = false; }
+}
+
+async function refreshPeriDll() {
+  periBusy.value = true; periMsg.value = "";
+  try {
+    const st = await invoke<{exists:boolean,loaded:boolean}>("peripherals_status");
+    if (!st.exists) {
+      periDllRunning.value = false;
+      periMsg.value = "未找到 peripherals.dll（组件缺失）";
+      return;
+    }
+    const raw = await invoke<PeriDetected[]>("peripherals_devices");
+    periDetected.value = raw;
+    periMsg.value = `检测到 ${raw.length} 个设备`;
+  } catch (e) { periMsg.value = String(e); }
+  finally { periBusy.value = false; }
+}
+onMounted(() => { loadPeri(); refreshLhws(); });
+
+function vidHex(n: number): string { return n.toString(16).padStart(4, "0"); }
+function addPeriSlot() {
+  periConfig.value.devices.push({ vid: "", pid: "", enabled: true, label: "" });
+}
+function removePeriSlot(i: number) {
+  periConfig.value.devices.splice(i, 1);
+}
+function onPeriDeviceChange(slot: PeriDevice, value: string) {
+  const [v, p] = value.split(":");
+  slot.vid = v || "";
+  slot.pid = p || "";
+  // Auto-fill label with device product string if label is empty
+  if (!slot.label.trim() && v && p) {
+    const vid = parseInt(v, 16);
+    const pid = parseInt(p, 16);
+    const found = periDetected.value.find((d) => d.vid === vid && d.pid === pid);
+    if (found) slot.label = found.product_string;
+  }
+}
+async function savePeri() {
+  for (let i = 0; i < periConfig.value.devices.length; i++) {
+    const s = periConfig.value.devices[i];
+    if (s.enabled) {
+      if (!s.vid || !s.pid) { periMsg.value = `第 ${i + 1} 个外设请选择设备`; return; }
+      if (!s.label.trim()) { periMsg.value = `第 ${i + 1} 个外设请填写名称`; return; }
+      const enabledCount = periConfig.value.devices.filter((d: PeriDevice) => d.enabled).length;
+      const maxLen = enabledCount >= 2 ? 6 : 16;
+      if (s.label.length > maxLen) { periMsg.value = `第 ${i + 1} 个外设名称不能超过 ${maxLen} 个字符`; return; }
+    }
+  }
+  periBusy.value = true; periMsg.value = "";
+  try {
+    await invoke("peripherals_set", { cfg: periConfig.value });
+    periMsg.value = "已保存";
+  } catch (e) { periMsg.value = String(e); }
+  finally { periBusy.value = false; }
+}
+
 </script>
 
 <template>
@@ -188,65 +291,6 @@ onMounted(() => {
     </div>
 
     <div class="card">
-      <h2><Icon icon="line-md:list" />运行日志</h2>
-      <div class="row">
-        <span class="lbl">输出运行日志</span>
-        <label class="sw">
-          <input type="checkbox" v-model="logging" />
-        </label>
-      </div>
-      <p class="hint">
-        开启时把运行日志写进 <code>log/jiaidian.log</code>（单文件上限 100 KB，超过轮转），
-        排查面板切换卡顿 / 接管失败时用。关闭后不再写日志，省掉这部分磁盘写入与内存开销。
-      </p>
-    </div>
-
-    <div class="card unit">
-      <h2><Icon icon="line-md:cog" />单位设置</h2>
-      <div class="row">
-        <span class="lbl">显示单位</span>
-        <select v-model="unitMode">
-          <option value="auto">全自动</option>
-          <option value="manual">手动指定</option>
-        </select>
-      </div>
-      <template v-if="unitMode === 'manual'">
-        <div class="row">
-          <span class="lbl">容量</span>
-          <select v-model="unitCapacity">
-            <option value="">跟随素材</option>
-            <option>B</option><option>KB</option><option>MB</option><option>GB</option><option>TB</option>
-          </select>
-        </div>
-        <div class="row">
-          <span class="lbl">速率</span>
-          <select v-model="unitRate">
-            <option value="">跟随素材</option>
-            <option>B/s</option><option>KB/s</option><option>MB/s</option><option>GB/s</option>
-          </select>
-        </div>
-        <div class="row">
-          <span class="lbl">温度</span>
-          <select v-model="unitTemp">
-            <option value="">跟随素材</option>
-            <option>℃</option><option>℉</option>
-          </select>
-        </div>
-        <div class="row">
-          <span class="lbl">时长</span>
-          <select v-model="unitDuration">
-            <option value="">跟随素材</option>
-            <option>秒</option><option>分</option><option>小时</option><option>天</option>
-          </select>
-        </div>
-      </template>
-      <p class="hint">
-        全自动：素材写 <code>data-unit</code> 就按它显示。手动指定：容量 / 速率 / 温度 / 时长
-        四族统一用这里选定的单位（覆盖素材），改完立刻生效。功耗固定 W。
-      </p>
-    </div>
-
-    <div class="card">
       <h2><Icon icon="line-md:cloud-alt-download" />数据源</h2>
       <div class="row">
         <span class="lbl">LibreHardwareService</span>
@@ -271,6 +315,46 @@ onMounted(() => {
         <a @click="openUrl(lhws?.licenseUrl || '')">许可</a>
       </p>
       <p class="hint">安装 / 重新启动 / 卸载都会弹一次 UAC；不修改该组件的任何文件。</p>
+
+      <div class="row" style="margin-top:16px">
+        <span class="lbl">peripherals.dll</span>
+        <span class="dot" :class="periDllRunning ? 'ok' : 'off'"></span>
+        <span class="val">{{ periDllRunning ? "运行中" : "已停止" }}</span>
+      </div>
+      <div class="btns" :class="{ 'two': !periDllRunning }">
+        <button v-if="!periDllRunning" class="primary" @click="startPeriDll" :disabled="periBusy">
+          {{ periBusy ? "处理中…" : "启动" }}
+        </button>
+        <button v-else @click="startPeriDll" :disabled="periBusy">
+          {{ periBusy ? "处理中…" : "重新启动" }}
+        </button>
+        <button @click="refreshPeriDll" :disabled="periBusy">重新检测</button>
+        <button v-if="periDllRunning" class="danger" @click="stopPeriDll" :disabled="periBusy">停止</button>
+      </div>
+      <p v-if="periMsg" class="hint">{{ periMsg }}</p>
+    </div>
+
+    <div class="card" v-if="periDllRunning">
+      <h2><Icon icon="line-md:list" />外设</h2>
+      <p class="hint">选择要显示的外设。顺序 = 面板显示顺序。</p>
+        <div v-for="(slot, i) in periConfig.devices" :key="i" class="peri-row">
+          <label class="sw"><input type="checkbox" v-model="slot.enabled" /></label>
+          <select class="peri-select" :value="slot.vid + ':' + slot.pid" @change="(e: any) => onPeriDeviceChange(slot, e.target.value)" :disabled="!slot.enabled">
+            <option value="">手动选择设备</option>
+            <option v-for="d in periDetected" :key="d.vid + ':' + d.pid" :value="vidHex(d.vid) + ':' + vidHex(d.pid)">
+              {{ d.product_string }} ({{ vidHex(d.vid) }}:{{ vidHex(d.pid) }})
+            </option>
+          </select>
+          <input v-model="slot.label" placeholder="显示名" class="peri-name" :class="{ 'input-error': slot.enabled && (!slot.label.trim() || slot.label.length > (periConfig.devices.filter((d: PeriDevice) => d.enabled).length >= 2 ? 6 : 16)) }" :maxlength="periConfig.devices.filter((d: PeriDevice) => d.enabled).length >= 2 ? 6 : 16" :disabled="!slot.enabled" />
+          <button @click="removePeriSlot(i)" :disabled="periBusy" class="mini-del">×</button>
+        </div>
+        <p v-if="periConfig.devices.some((d: PeriDevice) => d.enabled && (!d.label.trim() || d.label.length > (periConfig.devices.filter((x: PeriDevice) => x.enabled).length >= 2 ? 6 : 16)))" class="peri-warn">⚠ 已启用的外设名称不能为空，且两个及以上外设时名称最多6个字符</p>
+        <p v-if="periMsg" class="peri-msg" :class="{ 'ok': periMsg.includes('已保存') }">{{ periMsg }}</p>
+        <div class="btns two">
+          <button @click="addPeriSlot" :disabled="periBusy">添加外设</button>
+          <button @click="savePeri" :disabled="periBusy" class="primary">{{ periBusy ? "保存中…" : "保存并重启" }}</button>
+        </div>
+        <p class="hint">未识别的设备可手动选择 VID/PID；新协议支持需重编 peripherals.dll。</p>
     </div>
 
     <div class="card">

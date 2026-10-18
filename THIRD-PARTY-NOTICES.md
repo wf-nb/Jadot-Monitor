@@ -81,6 +81,14 @@
 界面图标取自 **Iconify** 的 `line-md` 图标集（MIT），已**离线打包**为 `src/line-md-icons.ts`，
 运行时不访问任何 CDN。
 
+### peripherals.dll（外设电量组件）
+
+| 组件 | 许可证 | 来源 |
+|---|---|---|
+| HaloBattery（协议参考与设备枚举策略） | MIT | https://github.com/HeyOkay/HaloBattery |
+
+Copyright (c) 2026 Halo Battery contributors.
+
 ---
 
 ## 说明

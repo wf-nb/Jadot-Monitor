@@ -63,6 +63,14 @@ fn main() {
         println!("{}", jiaidian_monitor_lib::lhws_state_json());
         return;
     }
+    if args.iter().any(|a| a == "--peripherals-state") {
+        println!("{}", jiaidian_monitor_lib::peripherals_state_json());
+        return;
+    }
+    if args.iter().any(|a| a == "--dump-peripherals") {
+        println!("{}", jiaidian_monitor_lib::dump_peripherals_json());
+        return;
+    }
     if args.iter().any(|a| a == "--lhws-install") {
         match jiaidian_monitor_lib::lhws_install_now() {
             Ok(m) => println!("OK://n{m}"),

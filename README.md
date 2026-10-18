@@ -22,6 +22,8 @@
 - **数据源**：LibreHardwareService（LHS）共享内存，程序内可一键下载 / 校验（sha256）/ 安装；网络由 Win32 `GetIfTable2` 统一提供。
 - **单位两档**：全自动（按素材声明的 `data-unit` 换算）/ 手动（四类单位各选一覆盖）。
 - **设置集中在一个文件**：exe 同级 `settings.ini`（带注释、可手工编辑），界面改动即原子写回。
+- **外设电量显示**：`peripherals.dll` 组件通过 HID 直读无线接收器（Akko 8K、Ninjutso Sora V2 等），
+  面板底部栏实时显示外设名称与电量百分比，随外设数量自适应布局；设置页可勾选外设、自定义名称。
 - **托盘常驻**：可设置关闭时收进系统托盘、开机静默启动；收托盘 / 最小化时自动停推预览（画面看不到就不传）。
 - **与官方上位机共存**：上位机（GUI）在运行时，通过其本地 HTTP 的 USB 使用权移交（`/usb/handoff/*`）借用 USB，**不需要退出 GUI**。
 
@@ -48,6 +50,7 @@ npm run tauri build    # 生产构建，产物在 src-tauri/target/release/ 与 
 
 - 可执行文件：`src-tauri/target/release/jiaidian-monitor.exe`
 - 安装包：`src-tauri/target/release/bundle/`（NSIS `.exe` + WiX `.msi`）
+- 外设电量组件：`peripherals/target/release/peripherals.dll`（随主程序一同编译打包）
 
 ### 便携运行布局
 
@@ -55,7 +58,9 @@ npm run tauri build    # 生产构建，产物在 src-tauri/target/release/ 与 
 
 ```
 jiaidian-monitor.exe
+peripherals.dll     外设电量读取组件（Akko / Ninjutso 等无线接收器）
 settings.ini       全部设置（自动生成，可手工编辑）
+peripherals.json   外设配置（自动生成，记录已启用的外设与自定义名称）
 assets/            主题素材（一个主题 = 一层文件夹，文件夹名即主题名）
 log/               运行日志（自动创建）
 ```
@@ -66,6 +71,7 @@ log/               运行日志（自动创建）
 
 ```
 本机数据采集 (Rust)                       ← LHS 共享内存 / Win32 GetIfTable2
+外设电量采集 (peripherals.dll)             ← HID 直读无线接收器协议（Akko/Compx、Ninjutso 等）
       ↓  注入数据槽 (window.__setSlot)
 单文件 HTML 面板（离屏 WebView2 渲染）
       ↓  CDP 抓帧 → RGB565
@@ -76,6 +82,9 @@ WinUSB 增量下发 → 设备屏
 
 - 程序自身起一个本地 HTTP 服务（`127.0.0.1:8766`）：`/metrics`（规范单位指标）、`/units`、`/health`。
   面板里的自取脚本每秒拉一次 `/metrics`，按 `data-unit` 换算后喂给 `__setSlot`。
+- **外设电量组件**（`peripherals.dll`）由主程序动态加载：通过 HID 直读无线接收器，
+  后台线程每 2 秒轮询电量并缓存 JSON。按 `peripherals.json` 中用户勾选的外设与自定义名称，将电量注入面板底部栏。
+  新增外设协议只需在 `peripherals/src/providers/` 下添加 provider 模块并重编 peripherals.dll，无需更新主程序。
 - 与官方上位机共用设备时，通过 `/usb/handoff/start|keepalive|finish` 借用 USB 使用权（租约 120s，程序每 20s 续期）。
 - 设备协议见 `src-tauri/src/live_frame.rs`、`device.rs`、`winusb.rs`。
 
@@ -97,11 +106,21 @@ src-tauri/              Rust 后端
     assets.rs           主题素材扫描与导入
     source_lhws.rs      LibreHardwareService 共享内存读取
     lhws_install.rs     LHS 检测 / 下载 / 校验 / 安装
-    metrics.rs          指标组装（含 Win32 磁盘 / 网络 / 开机时长）
+    metrics.rs          指标组装（含 Win32 磁盘 / 网络 / 开机时长 / 外设电量）
     units.rs            单位换算
     api.rs              本地 HTTP API（127.0.0.1:8766）
+    peripherals.rs      外设配置读取与保存（peripherals.json）
+    peripherals_dll.rs  peripherals.dll 动态加载与轮询缓存
     tray.rs / single.rs 托盘、单实例
   capabilities/         窗口权限
+peripherals/            外设电量 DLL 组件（Rust crate，产出 peripherals.dll）
+  src/
+    lib.rs              核心：HID 枚举、轮询调度、PeripheralBattery trait
+    main.rs             入口：加载配置 → 启动 HTTP 服务（端口 8767）
+    server.rs           内置 HTTP 服务：/devices、/metrics、/health
+    config.rs           peripherals.json 读写
+    compx.rs           compx（Akko 8K Receiver）协议实现
+    ninjutso.rs         Ninjutso Sora V2 协议实现
 ```
 
 ## 第三方组件

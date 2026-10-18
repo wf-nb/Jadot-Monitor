@@ -95,6 +95,99 @@ pub(crate) fn push_text(out: &mut Vec<BasicMetric>, group: &str, key: &str, labe
     });
 }
 
+// ---------------------------------------------------------------------------
+// 外设电量（peripherals.dll 动态加载，后台线程轮询缓存 JSON）
+// ---------------------------------------------------------------------------
+
+fn http_get(host: &str, port: u16, path: &str, timeout_ms: u64) -> Option<String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let mut stream = TcpStream::connect_timeout(
+        &format!("{host}:{port}").parse().ok()?,
+        Duration::from_millis(timeout_ms),
+    ).ok()?;
+    stream.set_read_timeout(Some(Duration::from_millis(timeout_ms))).ok()?;
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+    Some(body.to_string())
+}
+
+pub fn spawn_mouse_service() {
+    // Load peripherals.dll if enabled
+    if crate::settings::current().peripherals_enable {
+        crate::peripherals_dll::start();
+    }
+}
+
+pub(crate) fn mouse_fill(out: &mut Vec<BasicMetric>) {
+    if !crate::settings::current().peripherals_enable {
+        return;
+    }
+
+    // Ensure DLL is loaded and polling
+    crate::peripherals_dll::start();
+
+    // Get latest cached readings from DLL
+    let json = match crate::peripherals_dll::latest_json() {
+        Some(j) => j,
+        None => return,
+    };
+    let readings: serde_json::Value = match serde_json::from_str(&json) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let arr = match readings.as_array() {
+        Some(a) => a,
+        None => return,
+    };
+
+    // Get enabled peripherals config (in display order)
+    let cfg = crate::peripherals::peripherals_get();
+    let enabled: Vec<(u16, u16, String)> = cfg.devices.iter()
+        .filter(|d| d.enabled)
+        .map(|d| {
+            let label = if d.label.trim().is_empty() { "外设".to_string() } else { d.label.trim().to_string() };
+            (d.vid, d.pid, label)
+        })
+        .collect();
+
+    // For each enabled peripheral in config order, find matching reading
+    for (i, (_vid, _pid, label)) in enabled.iter().enumerate() {
+        let n = i + 1;
+
+        // Find matching reading: try label match first
+        let matched = arr.iter().find(|m| {
+            let mlabel = m.get("device_label").and_then(|l| l.as_str()).unwrap_or("");
+            mlabel == *label
+        });
+
+        if let Some(item) = matched {
+            let level = item.get("level_pct").and_then(|v| v.as_u64()).unwrap_or(0) as f64;
+            let charging = item.get("charging").and_then(|v| v.as_bool()).unwrap_or(false);
+            let text = if charging { format!("{level}% 充电中") } else { format!("{level}%") };
+            push(out, "外设", &format!("mouse{n}_pct"), label, "%", 0, Some(level), "peripherals.dll");
+            if let Some(last) = out.last_mut() {
+                last.text = text;
+            }
+            push_text(out, "外设", &format!("mouse{n}_label"), label, label, "peripherals.dll");
+        } else {
+            // No data for this device - push empty placeholders
+            push_text(out, "外设", &format!("mouse{n}_pct"), label, "", "peripherals.dll");
+            push_text(out, "外设", &format!("mouse{n}_label"), label, "", "peripherals.dll");
+        }
+    }
+    // Pad remaining slots up to 2
+    for n in (enabled.len() + 1)..=2 {
+        push_text(out, "外设", &format!("mouse{n}_pct"), "", "", "peripherals.dll");
+        push_text(out, "外设", &format!("mouse{n}_label"), "", "", "peripherals.dll");
+    }
+}
+
 /// 精简 CPU 型号，只留**最终型号**：
 /// `AMD Ryzen 7 9700X` → `9700X`；`Intel Core i9-14900K` → `14900K`；`Intel Core i7-14700K` → `14700K`。
 ///
@@ -613,6 +706,7 @@ pub fn basic() -> Vec<BasicMetric> {
         }
         Ok(sample) => select_cpu_source(&mut out, token.0, sample),
     }
+    mouse_fill(&mut out);
     sort_groups(&mut out);
     out
 }

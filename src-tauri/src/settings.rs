@@ -47,6 +47,8 @@ pub struct Settings {
     pub unit_rate: String,
     pub unit_temperature: String,
     pub unit_duration: String,
+    /// Peripheral battery monitoring (peripherals.dll). Default off.
+    pub peripherals_enable: bool,
 }
 
 impl Default for Settings {
@@ -64,6 +66,7 @@ impl Default for Settings {
             unit_rate: String::new(),
             unit_temperature: String::new(),
             unit_duration: String::new(),
+            peripherals_enable: false,
         }
     }
 }
@@ -109,6 +112,7 @@ impl Settings {
             unit_rate: s("units.rate").unwrap_or("").trim().to_string(),
             unit_temperature: s("units.temperature").unwrap_or("").trim().to_string(),
             unit_duration: s("units.duration").unwrap_or("").trim().to_string(),
+            peripherals_enable: s("peripherals.enable").map(truthy).unwrap_or(d.peripherals_enable),
         }
     }
 
@@ -144,7 +148,11 @@ impl Settings {
              capacity={}\n\
              rate={}\n\
              temperature={}\n\
-             duration={}\n",
+             duration={}\n\
+             \n\
+             [peripherals]\n\
+             ; 外设电量（鼠标）：0 = 关闭，1 = 启用 peripherals.dll\n\
+             enable={}\n",
             b(self.silent_start),
             b(self.logging),
             b(self.high_fps),
@@ -157,6 +165,7 @@ impl Settings {
             self.unit_rate,
             self.unit_temperature,
             self.unit_duration,
+            b(self.peripherals_enable),
         )
     }
 }
@@ -313,6 +322,7 @@ fn patched(previous: &Settings, patch: &Value) -> Settings {
     s.unit_rate = t("unitRate", &s.unit_rate);
     s.unit_temperature = t("unitTemp", &s.unit_temperature);
     s.unit_duration = t("unitDuration", &s.unit_duration);
+    s.peripherals_enable = b("peripheralsEnable", s.peripherals_enable);
 
     s
 }
@@ -332,6 +342,7 @@ pub fn to_json(s: &Settings) -> Value {
         "unitRate": s.unit_rate,
         "unitTemp": s.unit_temperature,
         "unitDuration": s.unit_duration,
+        "peripheralsEnable": s.peripherals_enable,
     })
 }
 

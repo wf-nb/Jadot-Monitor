@@ -17,6 +17,8 @@ pub use render::PANEL_CDP_PORT;
 mod pipeline;
 mod render;
 mod settings;
+mod peripherals;
+mod peripherals_dll;
 pub mod single;
 mod tray;
 mod winusb;
@@ -25,6 +27,7 @@ use serde_json::json;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tauri::Manager;
+use peripherals::{peripherals_get, peripherals_set, peripherals_devices, peripherals_status};
 
 /// 主 AppHandle（`setup` 时存入）：本地 API 线程靠它切到主线程干活。
 static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
@@ -580,6 +583,9 @@ pub fn run() {
     // 本地指标 API：面板网页直接 fetch，无需注入。
     api::spawn();
 
+    // 加载 peripherals.dll（外设电量）。
+    metrics::spawn_mouse_service();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -648,7 +654,11 @@ pub fn run() {
             link_state,
             assets_dir,
             import_panel,
-            hide_to_tray
+            hide_to_tray,
+            peripherals_get,
+            peripherals_set,
+            peripherals_devices,
+            peripherals_status
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -677,4 +687,24 @@ pub fn run() {
             }
             _ => {}
         });
+}
+
+/// CLI: peripherals DLL state.
+pub fn peripherals_state_json() -> String {
+    let exe = std::env::current_exe().ok();
+    let exists = exe.as_ref()
+        .and_then(|p| p.parent())
+        .map(|d| d.join("peripherals.dll").exists())
+        .unwrap_or(false);
+    let loaded = peripherals_dll::is_loaded();
+    serde_json::json!({ "exists": exists, "loaded": loaded }).to_string()
+}
+
+/// CLI: dump peripherals battery readings.
+pub fn dump_peripherals_json() -> String {
+    if !settings::current().peripherals_enable {
+        return "[]".into();
+    }
+    peripherals_dll::start();
+    peripherals_dll::latest_json().unwrap_or_else(|| "[]".into())
 }

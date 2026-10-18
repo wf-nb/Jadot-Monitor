@@ -210,6 +210,7 @@ pub fn info(serial: Option<String>) -> Result<serde_json::Value, String> {
                 _ => "UNKNOWN".into(),
             });
         let flash_id = f.get(1).map(|s| s.trim().to_string()).unwrap_or_default();
+        // Variant comes from JED HW= field, not from endpoint numbers.
         let mv = pong
             .strip_prefix("PONG,")
             .and_then(|s| s.trim().parse::<i64>().ok());
